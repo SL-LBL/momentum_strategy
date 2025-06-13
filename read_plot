@@ -1,0 +1,112 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+import os
+
+def read_excel_sheets(path, start=0, end=None, merge_col='Date'):
+    """
+    Reads and merges multiple sheets from an Excel file on a common column.
+
+    Parameters:
+        path (str): Path to the Excel file.
+        start (int): Index of the first sheet to read.
+        end (int or None): Index of the last sheet to read (non-inclusive). If None, reads to the end.
+        merge_col (str): Column name to merge all sheets on.
+
+    Returns:
+        pd.DataFrame: Merged DataFrame containing data from the selected sheets.
+    """
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"File not found: {path}")
+    sheet_names = pd.ExcelFile(path).sheet_names
+    selected_sheets = sheet_names[start:end]
+    if not selected_sheets:
+        raise ValueError("No sheets selected for reading.")
+    data = None
+    for sheet in selected_sheets:
+        df = pd.read_excel(path, sheet_name=sheet, engine='openpyxl')
+        df.columns = [merge_col] + [f'{sheet}_{col}' for col in df.columns[1:]]
+        if data is None:
+            data = df
+        else:
+            data = pd.merge(data, df, on=merge_col, how='outer')
+    return data
+
+
+def plot_series(df, title='', fname='Save', save=False):
+    """
+    Plots a time series from a DataFrame.
+
+    Parameters:
+    df (pd.DataFrame): The DataFrame containing the time series data.
+    title (str): The title of the plot.
+    fname (str): The filename to save the figure as.
+    save (bool): Whether to save the figure or not.
+
+    Returns:
+    None
+    """
+    plt.figure(figsize=(9, 6))
+    for col in df:
+        plt.plot(df[col], label=col)
+    plt.grid(True)
+    plt.legend()
+    plt.title(title)
+    plt.xlabel('Date')
+    plt.ylabel('Value')
+    if save:
+        plt.savefig(fname)
+    plt.show()
+
+
+def get_cum_rtns(returns, additive=False):
+    """
+    Calculate cumulative returns.
+
+    Parameters:
+    returns (pd.DataFrame): DataFrame of returns in decimals. The index must be datetime.
+    additive (bool): If True, use additive returns. Otherwise, use multiplicative returns.
+
+    Returns:
+    pd.DataFrame: DataFrame of cumulative returns.
+    """
+    returns.index = pd.to_datetime(returns.index)
+    if additive:   
+        return (1 + returns).cumprod() - 1
+    else:
+        return returns.cumsum()
+
+
+def plot_cum_rtns(df, title='', fname='Save', additive=False, save=False, dotted_series=None):
+    """
+    Plots multiple cumulative returns. 
+    
+    Parameters:
+    df (pd.DataFrame): DataFrame of returns in decimals. The index must be datetime.
+    title (str): Title of the plot.
+    fname (str): Name to save the file as.
+    additive (bool): If True, use additive returns. Otherwise, use multiplicative returns.
+    save (bool): If true, saves the file.
+    dotted_series (str): Name of the series to be plotted with a dotted line.
+
+    Returns:
+    None
+    """
+    cum_ret = get_cum_rtns(df, additive)
+    plt.figure(figsize=(9, 6))
+    for series in cum_ret:
+        linestyle = 'dotted' if series == dotted_series else 'solid'
+        plt.plot(cum_ret[series], label=series, linestyle=linestyle)
+    plt.grid(True)
+    plt.legend()
+    plt.title(title)
+    plt.xlabel('Date')
+    plt.ylabel('Return')
+    if save:
+        plt.savefig(fname)
+    plt.show()
+
+
+def calc_mdd(df):
+    cumulative = df['DailyReturn']
+    peak = cumulative.cummax()
+    return abs((cumulative - peak).min())
