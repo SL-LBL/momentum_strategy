@@ -1,0 +1,115 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.ndimage import uniform_filter
+
+
+
+def cluster_maxidx(df, window):
+    """
+    Ensure the window size is odd, perform clustering, and return the index and column names of the highest number in the cluster.
+    
+    Parameters:
+    df (pd.DataFrame): The input dataframe.
+    window (int): The window size (N), representing an NxN box around the centroid.
+    
+    Returns:
+    tuple: The index (slow_window) and column (fast_window) names of the highest number in the cluster.
+    """
+    if window % 2 == 0: # force window to be odd so each cluster centers on the representative window
+        window += 1
+    fill = df.mean().mean() # fill NaN and extend df border with the mean value
+    clustered = pd.DataFrame(uniform_filter(df.fillna(fill), size=window, mode='constant', cval=fill), index=df.index, columns=df.columns)
+    max_index = clustered.stack().idxmax()
+    return max_index # max_index: slow_window, max_index: fast_window
+
+
+def plot_series(df, title='', fname='Save', save=False):
+    """
+    Plots a time series from a DataFrame.
+
+    Parameters:
+    df (pd.DataFrame): The DataFrame containing the time series data.
+    title (str): The title of the plot.
+    fname (str): The filename to save the figure as.
+    save (bool): Whether to save the figure or not.
+
+    Returns:
+    None
+    """
+    fig = plt.figure(figsize=(9, 6))
+    for col in df:
+        plt.plot(df[col], label=col)
+    plt.grid(True)
+    plt.legend()
+    plt.title(title)
+    plt.xlabel('Date')
+    plt.ylabel('Value')
+    if save:
+        plt.savefig(fname)
+    plt.show()
+
+
+
+def get_cum_rtns(returns, additive=True):
+    """
+    Calculate cumulative returns.
+
+    Parameters:
+    returns (pd.DataFrame): DataFrame of returns in decimals. The index must be datetime.
+    additive (bool): If True, use additive returns. Otherwise, use multiplicative returns.
+
+    Returns:
+    pd.DataFrame: DataFrame of cumulative returns.
+    """
+    returns.index = pd.to_datetime(returns.index)
+    if additive:   
+        return returns.cumsum()
+    else:
+        return (1 + returns).cumprod() - 1
+
+
+def plot_cum_rtns(df, title='', fname='Save', additive=True, save=False, dotted_series=None):
+    """
+    Plots multiple cumulative returns. 
+    
+    Parameters:
+    df (pd.DataFrame): DataFrame of returns in decimals. The index must be datetime.
+    title (str): Title of the plot.
+    fname (str): Name to save the file as.
+    additive (bool): If True, use additive returns. Otherwise, use multiplicative returns.
+    save (bool): If true, saves the file.
+    dotted_series (str): Name of the series to be plotted with a dotted line.
+
+    Returns:
+    None
+    """
+    cum_ret = get_cum_rtns(df, additive)
+    fig = plt.figure(figsize=(9, 6))
+    for series in cum_ret:
+        linestyle = 'dotted' if series == dotted_series else 'solid'
+        plt.plot(cum_ret[series], label=series, linestyle=linestyle)
+    plt.grid(True)
+    plt.legend()
+    plt.title(title)
+    plt.xlabel('Date')
+    plt.ylabel('Return')
+    if save:
+        plt.savefig(fname)
+    plt.show()
+
+
+def millions(x, pos):
+    'The two args are the value and tick position'
+    return '%1.0fM' % (x*1e-6)
+
+
+def calc_mdd(df) -> float:
+    cumulative = df['DailyReturn']
+    peak = cumulative.cummax()
+    return abs((cumulative - peak).min())
+
+
+def divide_chunks(lst, n):
+    for j in range(0, len(lst), n): 
+        yield lst[j : j+n]
