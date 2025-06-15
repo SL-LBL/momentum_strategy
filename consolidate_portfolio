@@ -1,7 +1,6 @@
 import pandas as pd
 from .momentum_functions import TransformTickerDescs, cross_over_strategy, cross_over_strategy_long_short
 from .util_function import plot_cum_rtns, plot_series
-from .sql_handler import get_HFRIMTF
 import riskfolio as rf
 
 
