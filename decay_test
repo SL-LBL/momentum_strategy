@@ -1,0 +1,124 @@
+import os
+from support_codes.model_selection import *
+from support_codes.consolidate_portfolio import *
+
+
+##################################################### SETTINGS #####################################################
+# Decay Rates Tested
+declist = [0.005, 0.01, 0.015, 0.02, 0.025, 0.03]
+
+# Backtest Settings
+AmountInvested = 100000000 # Target notional in CAD
+dv01_budget = 270000 # In CAD
+trade_cost = 0.20 # In bps
+trade_cost_LS = 0.15 # In bps
+
+# Cross Over Scenarios Engine Settings
+relativePnL = True # Toggle to generate returns in % or in $Amt
+decay = True # Toggle to exponentially decay longer history to give more weight to recent data
+decayrate = 0.01 # Exponential decay rate if previous toggle is True
+
+# Data Source and Filepath Settings
+bbg_data = False #Toggle to pull from BBG API or pull data from Excel files
+path = os.getcwd()
+data_path = os.path.join(path, 'Data', 'futures data.xlsx') # Comment out if pulling directly from BBG
+fx_path = os.path.join(path, 'Data', 'DM FX data.xlsx') # Comment out if pulling directly from BBG
+rates_path = os.path.join(path, 'Data', 'DM rates history.xlsx') # Comment out if pulling directly from BBG
+
+# Pandas Settings
+pd.set_option('mode.chained_assignment', None) # Disable pandas warning for not modifying original dataframe
+pd.set_option('expand_frame_repr', False) # Print dataframes in a single line if it fits
+pd.set_option('display.max_columns', 15) # Truncate middle columns if len(df.columns) > 15
+
+
+##################################################### LOADING DATA #####################################################
+############################################## IGNORE IF PULLING FROM BBG ##############################################
+if bbg_data:
+    from support_codes.bbg import *
+    ### Adapt to pull from BBG
+
+else:
+    sheet_names = pd.ExcelFile(data_path).sheet_names
+    data = pd.DataFrame(columns=['Date'])
+    for sheet in sheet_names[1:]:
+        df = pd.read_excel(data_path, sheet_name=sheet, engine='openpyxl')
+        if sheet.endswith(" Curncy"):
+            df = df[['Date', 'PX_LAST', 'PX_BID', 'PX_ASK']]
+            df.columns = ['Date', f'{sheet}_mid', f'{sheet}_bid', f'{sheet}_ask']
+        else:
+            df = df[['Date', 'PX_LAST', 'PX_BID', 'PX_ASK', 'FUT_EQV_DUR_NOTL']]
+            df.columns = ['Date', f'{sheet}_mid', f'{sheet}_bid', f'{sheet}_ask', f'{sheet}_Dur']
+        df['Date'] = pd.to_datetime(df['Date'])
+        data = pd.merge(data, df, on='Date', how='outer')
+
+    sheet_names = pd.ExcelFile(fx_path).sheet_names
+    for sheet in sheet_names:
+        df = pd.read_excel(fx_path, sheet_name=sheet, engine='openpyxl')
+        df.columns = ['Date', f'{sheet}']
+        df['Date'] = pd.to_datetime(df['Date'])
+        data = pd.merge(data, df, on='Date', how='outer')
+
+    data_oos = data[data['Date'] <= '2008-01-01']
+    data = data[(data['Date'] >= '2007-01-01') & (data['Date'] <= '2025-04-30')]
+    data[['SFR_Dur','SFR_offset1_Dur','SFR_offset2_Dur','SFR_offset3_Dur','SER_Dur','SER_offset1_Dur','SER_offset2_Dur',\
+          'SER_offset3_Dur','COR_Dur','COR_offset1_Dur','COR_offset2_Dur','COR_offset3_Dur','OOR_Dur']] = 1
+    # Force SOFR and CORRA duration to 1 for compatibility with functions
+
+
+##################################################### ALL FUTURES #####################################################
+#ticker, ccy, CurrentDuration, Weight, MV/Contract, FXRate, ContractSizeLocal, fast_window, slow_window
+TickerDescs = [('TU', 'USD', 1.9159, float("nan"), float("nan"), 1.397, 200000, 20, 50), #US 2yr
+               ('FV', 'USD', 4.4194, float("nan"), float("nan"), 1.397, 100000, 20, 50), #US 5yr
+               ('TY', 'USD', 7.7915, float("nan"), float("nan"), 1.397, 100000, 20, 45), #US 10yr
+               ('UXY', 'USD', 7.8153, float("nan"), float("nan"), 1.397, 100000, 10, 50), #US ultra 10yr
+               ('US', 'USD', 12.4145, float("nan"), float("nan"), 1.397, 100000, 10, 50), #US t-bond
+               ('WN', 'USD', 15.352, float("nan"), float("nan"), 1.397, 100000, 15, 55), #US ultra t-bond
+               ('CV', 'CAD', 1.917, float("nan"), float("nan"), 1.000, 100000, 20, 60), #CA 2yr
+               ('XQ', 'CAD', 4.4424, float("nan"), float("nan"), 1.000, 100000, 10, 70), #CA 5yr
+               ('CN', 'CAD', 7.9259, float("nan"), float("nan"), 1.000, 100000, 10, 60), #CA 10yr
+               ('DU', 'EUR', 1.9453, float("nan"), float("nan"), 1.568, 100000, 20, 70), #EU 2yr
+               ('OE', 'EUR', 4.5144, float("nan"), float("nan"), 1.568, 100000, 20, 70), #EU 5yr
+               ('RX', 'EUR', 8.1062, float("nan"), float("nan"), 1.568, 100000, 10, 120), #EU 10yr
+               ('BPSWS2 Curncy', 'GBP', 1.918, float("nan"), float("nan"), 1.8592, 100000, 20, 60), #UK 2yr SONIA (ContractSize is a dummy for compatibility)
+               ('BPSWS5 Curncy', 'GBP', 4.532, float("nan"), float("nan"), 1.8592, 100000, 20, 75), #UK 5yr SONIA (ContractSize is a dummy for compatibility)
+               ('BPSWS10 Curncy', 'GBP', 8.187, float("nan"), float("nan"), 1.8592, 100000, 35, 105), #UK 10yr SONIA (ContractSize is a dummy for compatibility)
+               ('BPSWS20 Curncy', 'GBP', 13.215, float("nan"), float("nan"), 1.8592, 100000, 20, 110), #UK 20yr SONIA (ContractSize is a dummy for compatibility)
+               ('BPSWS30 Curncy', 'GBP', 16.234, float("nan"), float("nan"), 1.8592, 100000, 20, 110), #UK 30yr SONIA (ContractSize is a dummy for compatibility)
+               ('JB', 'JPY', 8.0646, float("nan"), float("nan"), 0.0096375, 100000000, 20, 110), #JP 10yr
+               ('SFR', 'USD', 1, float("nan"), float("nan"), 1.397, 250000, 10, 50), #3m SOFR
+               ('SFR_offset1', 'USD', 1, float("nan"), float("nan"), 1.397, 250000, 20, 60), #3m SOFR, rolled into 2nd contract
+               ('SFR_offset2', 'USD', 1, float("nan"), float("nan"), 1.397, 250000, 25, 55), #3m SOFR, rolled into 3rd contract
+               ('SFR_offset3', 'USD', 1, float("nan"), float("nan"), 1.397, 250000, 15, 50), #3m SOFR, rolled into 4th contract
+               ('SER', 'USD', 1, float("nan"), float("nan"), 1.397, 416700, 7, 25), #1m SOFR
+               ('SER_offset1', 'USD', 1, float("nan"), float("nan"), 1.397, 416700, 30, 90), #1m SOFR, rolled into 2nd contract
+               ('SER_offset2', 'USD', 1, float("nan"), float("nan"), 1.397, 416700, 20, 50), #1m SOFR, rolled into 3rd contract
+               ('SER_offset3', 'USD', 1, float("nan"), float("nan"), 1.397, 416700, 15, 90), #1m SOFR, rolled into 4th contract
+               ('COR', 'CAD', 1, float("nan"), float("nan"), 1.000, 250000, 10, 80), #3m CORRA
+               ('COR_offset1', 'CAD', 1, float("nan"), float("nan"), 1.000, 250000, 35, 110), #3m CORRA, rolled into 2nd contract
+               ('COR_offset2', 'CAD', 1, float("nan"), float("nan"), 1.000, 250000, 35, 110), #3m CORRA, rolled into 3rd contract
+               ('COR_offset3', 'CAD', 1, float("nan"), float("nan"), 1.000, 250000, 20, 75), #3m CORRA, rolled into 4th contract
+               ]
+port = PortfolioMomentum(TickerDescs, dv01_budget, AmountInvested, trade_cost, data, 'futures', relativePnL=relativePnL)
+
+fast_range = range(5, 51, 5)
+slow_range = range(20, 205, 10)
+decay_eval = {}
+fast_slow_pairs = [(fast, slow) for fast in fast_range for slow in slow_range if fast < slow]
+for dec in declist:
+    decay_eval[f'{dec}_decay'] = {}
+    for ticker, currency, notional, weight, contracts, dv01, *_ in port.adj_descs:
+        result_df = pd.DataFrame(index=fast_range, columns=slow_range, dtype=float)
+        for fast, slow in fast_slow_pairs:
+            base = cross_over_strategy(ticker, currency, notional, contracts, dv01, trade_cost, fast, slow, data, RelativePnL=relativePnL)
+            decayed = cross_over_strategy(ticker, currency, notional, contracts, dv01, trade_cost, fast, slow, data,
+                                          RelativePnL=relativePnL, decay=decay, decayrate=dec)
+            result_df.loc[fast, slow] = performance_metrics(decayed)['sharpe'] - performance_metrics(base)['sharpe']
+        decay_eval[f'{dec}_decay'][ticker] = result_df
+        print(f'{ticker} mean improvement at {dec} decay: {result_df.mean().mean()}')
+        plot_3d_surface(decay_eval[f'{dec}_decay'][ticker])
+
+
+
+for dec in declist:
+    plot_heatmap(decay_eval[f'{dec}_decay'].T, annot=False)
+    plot_3d_surface(decay_eval[f'{dec}_decay'].T)
