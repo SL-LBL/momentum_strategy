@@ -1,0 +1,664 @@
+from .util_function import *
+from .sql_handler import *
+#from concurrent.futures import ProcessPoolExecutor, as_completed
+#import multiprocessing
+import math
+
+# SL adjusted - June 2025
+# WIP - break up this file for better clarity
+# Future - adapt for CDX
+
+################################################# Preliminary Class #################################################
+#Takes in a list of tuples of securities information and transforms it to be compatible with the strategy functions.
+class TransformTickerDescs:
+    """A class to assign security weights based on dv01 budget"""
+        
+    def __init__(self, tickerDescs, budget, AmtInvested):
+        """
+        Initialize AssignWeight class.
+
+        Parameters:
+        tickerDescs (list): A list of tuples with ticker descriptions in the order:
+            Futures: ticker, ccy, CurrentDuration, Weight, MV/Contract, FXRate, ContractSizeLocal, fast_window, slow_window
+            Yields: ticker, ccy, CurrentDuration, Weight, MV, fast_window, slow_window
+            Long-short futures: ticker, ccy, CurrentDuration, Direction, Pair#, Weight, MV/Contract, FXRate, ContractSizeLocal, fast_window, slow_window
+        budget (float): The total budget for investments
+        AmtInvested (float): The notional investment target
+        """
+        self.tickerDescs = tickerDescs
+        self.budget = budget
+        self.AmtInvested = AmtInvested
+
+    def futures(self):
+        """
+        Calculate weights based on ticker descriptions, budget and amount invested. (For data in futures)
+
+        Returns:
+        list of tuples: Modified ticker descriptions with futures in the following order:
+        (Ticker, Currency, Notional, Weight, #Contracts, DV01(CAD), FX, Notional/contract(Local), fast_window, slow_window)
+        """
+        dv01s = [x[6]*x[5]*x[2]/10000 for x in self.tickerDescs]
+        budgetShare = self.budget/len(self.tickerDescs)
+        contracts = [round(budgetShare/dv01s[idx]) for idx, x in enumerate(self.tickerDescs)]
+        notionals = [contracts[idx]*x[5]*x[6] for idx, x in enumerate(self.tickerDescs)]
+        totalNotional = sum(notionals)
+        tickerDescs = [x[:2]+(contracts[idx]*x[6]*x[5], notionals[idx]/totalNotional, contracts[idx], dv01s[idx])+x[5:] for idx, x in enumerate(self.tickerDescs)]  
+        return tickerDescs
+
+    def long_short(self):
+        """
+        Calculate weights based on ticker descriptions, budget and amount invested. (For data in pairs long-short futures)
+
+        Returns:
+        list of tuples: Modified ticker descriptions with futures in the following order:
+        (Ticker, Currency, Direction, Pair#, Notional, Weight, #Contracts, DV01(CAD), FX, Notional/contract(Local), fast_window, slow_window)
+        """
+        dv01s = [x[7]*x[8]*x[4]/10000 for x in self.tickerDescs]
+        budgetShare = self.budget/len(set([x[3] for x in self.tickerDescs])) # Each each pair equally splits the total dv01 budget
+        contracts = [x[2]*round(budgetShare/dv01s[idx]) for idx, x in enumerate(self.tickerDescs)]
+        notionals = [contracts[idx]*x[7]*x[8] for idx, x in enumerate(self.tickerDescs)]
+        grossNotional = sum(abs(notional) for notional in notionals)
+        tickerDescs = [x[:4] + (notionals[idx], notionals[idx]/grossNotional, contracts[idx], dv01s[idx]) + x[8:] for idx, x in enumerate(self.tickerDescs)]            
+        return tickerDescs
+
+    def tickers(self):
+        """
+        Extract and return ticker names from ticker descriptions.
+
+        Returns:
+        list of tuples: Modified ticker descriptions with futures in the following order:
+        (Ticker, Currency, Duration, Weight, Notionals, fast_window, slow_window)
+        """
+        return [x[0] for x in self.tickerDescs]
+
+    def unpack_long_short(self):
+        """
+        Unpack the output from the 'long_short_futures' method into a dictionary grouped by pair number.
+
+        Returns:
+        A dictionary with the following structure:
+        {
+            pair_number: {
+                'tickers'(list),
+                'currencies'(list),
+                'directions'(list),
+                'notionals'(list),
+                'weights'(list),
+                'contracts'(list),
+                'dv01s'(list),
+                'contract_sizes'(list)
+            }
+        }
+        """
+        LongShortDescs = self.long_short()
+        LongShortDict = {}
+        for pair_num in set(x[3] for x in LongShortDescs):
+            LongShortDict[pair_num] = {}
+            LongShortDict[pair_num]['tickers'] = [x[0] for x in LongShortDescs if x[3] == pair_num]
+            LongShortDict[pair_num]['currencies'] = [x[1] for x in LongShortDescs if x[3] == pair_num]
+            LongShortDict[pair_num]['directions'] = [x[2] for x in LongShortDescs if x[3] == pair_num]
+            LongShortDict[pair_num]['notionals'] = [x[4] for x in LongShortDescs if x[3] == pair_num]
+            LongShortDict[pair_num]['weights'] = [x[5] for x in LongShortDescs if x[3] == pair_num]
+            LongShortDict[pair_num]['contracts'] = [x[6] for x in LongShortDescs if x[3] == pair_num]
+            LongShortDict[pair_num]['dv01s'] = [x[7] for x in LongShortDescs if x[3] == pair_num]
+            LongShortDict[pair_num]['contract_sizes'] = [x[8] for x in LongShortDescs if x[3] == pair_num]
+        return LongShortDict
+    
+    # def yields(self):
+    #     """
+    #     Calculate weights based on ticker descriptions, budget and amount invested. (For data in yields)
+
+    #     Returns:
+    #     list of tuples: Modified ticker descriptions with futures in the following order:
+    #     (Ticker, Currency, Duration, Weight, Notionals, fast_window, slow_window)
+    #     """
+    #     wghts = [1/x[2] for x in self.tickerDescs]
+    #     totalW = sum(wghts)
+    #     wghts = [x/totalW for x in wghts]
+    #     tickerDescs = [x[:3]+(wghts[idx], round(wghts[idx]*self.AmtInvested,2))+x[5:] for idx, x in enumerate(self.tickerDescs)]
+    #     return tickerDescs
+
+
+################################################# Strategy functions #################################################
+def momentum_2nd_order(data, ticker, fast_slope, slow_slope, buffer_2nd, override_sig=False, dynamic_alloc=True):
+    """
+    Applies secondary momentum filter to enhance crossover signal based on relative slope strength.
+
+    Parameters:
+        data (DataFrame): DataFrame containing the price and initial Signal columns.
+        ticker (str): Ticker column to operate on.
+        fast_slope (int): Window for fast slope calculation.
+        slow_slope (int): Window for slow slope calculation.
+        buffer_2nd (float): Minimum ratio threshold to confirm secondary signal.
+
+    Returns:
+        DataFrame: Updated DataFrame with Signal_2nd and final Signal columns.
+    """
+    assert fast_slope < slow_slope
+    data['Pchange_fast'] = data[ticker].diff(fast_slope) / fast_slope
+    data['Pchange_slow'] = data[ticker].diff(slow_slope) / slow_slope
+    data['Pchange_ratio'] = (data['Pchange_fast'] - data['Pchange_slow']) / data['Pchange_slow'].abs()
+    if dynamic_alloc:
+        data['dir_correct'] = np.where(((data['Pchange_fast'] < 0) & (data['Pchange_slow'] < 0) & (data['Pchange_fast'] > data['Pchange_slow'])) |
+                                       ((data['Pchange_fast'] > 0) & (data['Pchange_slow'] > 0) & (data['Pchange_fast'] < data['Pchange_slow'])), -1, 1)
+        data['alloc_correct'] = np.where(data['dir_correct'] < 0, 1, 2)
+    else:
+        data['dir_correct'] = np.where(((data['Pchange_fast'] < 0) & (data['Pchange_slow'] < 0) & (data['Pchange_fast'] > data['Pchange_slow'])) |
+                                       ((data['Pchange_fast'] > 0) & (data['Pchange_slow'] > 0) & (data['Pchange_fast'] < data['Pchange_slow'])), 0, 1)
+    data['Pchange_ratio'] = data['Pchange_ratio'] * data['dir_correct']
+    data['Signal_2nd'] = 0
+    data.loc[data['Pchange_ratio'] > buffer_2nd, 'Signal_2nd'] = 1
+    data.loc[data['Pchange_ratio'] < -buffer_2nd, 'Signal_2nd'] = -1
+    if dynamic_alloc:
+        data['Signal'] = np.where(
+            (data['Signal'] == 1) & (data['Signal_2nd'] == 1), 1,
+            np.where((data['Signal'] == -1) & (data['Signal_2nd'] == -1), -1, 0)
+        ).astype(int)
+        data['Allocation'] = data['Signal'] * data['alloc_correct']
+    if override_sig:
+        data['Signal'] = data['Signal_2nd']
+    else:
+        data['Signal'] = np.where(
+            (data['Signal'] == 1) & (data['Signal_2nd'] == 1), 1,
+            np.where((data['Signal'] == -1) & (data['Signal_2nd'] == -1), -1, 0)
+        ).astype(int)
+    return data
+
+def cross_over_strategy(ticker, curr, notional, contracts, dv01, cost, fast_window, slow_window, df, momentum_2nd=False,
+                        fast_slope=None, slow_slope=None, buffer_2nd=0.0, RelativePnL=False, decay=False, decayrate=None,
+                        ignore_1st_order=False, dynamic_alloc=False):
+    """
+    Implement a crossover strategy and calculate trading metrics.
+
+    Parameters:
+    ticker (str): The ticker symbol
+    curr (str): The contract's local currency
+    notional (float): The notional value of the investment
+    contracts (int): the number of contracts needed
+    dv01 (float): dv01 of each contract
+    cost (float): The cost of trading
+    fast_window (int): The window size for fast moving average
+    slow_window (int): The window size for slow moving average
+    df (DataFrame): The data frame with the price data
+    momentum_2nd (bool):
+    fast_slope (int):
+    slow_slope (int):
+    buffer_2nd (float): 
+    RelativePnL (bool): If True, rescale PnL to percentage format
+    decay (bool): If True, apply the decay rate to historical differences before MA
+    decayrate (float): The rate to exponentially decay previous data
+
+    Returns:
+    DataFrame: The data frame with calculated metrics
+    """
+    assert fast_window < slow_window
+    if ticker.endswith(" Curncy"): # different calculation for UK because using swaps
+        data = df[['Date', f'{ticker}_mid'] + ([curr] if curr != 'CAD' else [])].set_index('Date').sort_index(ascending=True).dropna()
+        data.columns = [ticker] + ([curr] if curr != 'CAD' else [])
+    else:
+        data = df[['Date', f'{ticker}_mid', f'{ticker}_Dur'] + ([curr] if curr != 'CAD' else [])].set_index('Date').sort_index(ascending=True).dropna()
+        data.columns = [ticker, 'duration'] + ([curr] if curr != 'CAD' else [])
+    if ignore_1st_order:
+        if dynamic_alloc:
+            print('Cannot override 1st order signal if dynamica allocation is true')
+        override=True
+        data = momentum_2nd_order(data=data, ticker=ticker, fast_slope=fast_slope, slow_slope=slow_slope, buffer_2nd=buffer_2nd, override_sig=override)
+    else:
+        if decay:
+            data['FMA'] = decay_moving_avg(data[ticker], fast_window, decayrate=decayrate)
+            data['SMA'] = decay_moving_avg(data[ticker], slow_window, decayrate=decayrate)
+        else:
+            data['FMA'] = data[ticker].rolling(window=fast_window).mean()
+            data['SMA'] = data[ticker].rolling(window=slow_window).mean()
+        data['Signal'] = (data['FMA'] > data['SMA']).astype(int) - (data['FMA'] < data['SMA']).astype(int)
+        if momentum_2nd:
+            data = momentum_2nd_order(data=data, ticker=ticker, fast_slope=fast_slope, slow_slope=slow_slope, 
+                                      buffer_2nd=buffer_2nd, dynamic_alloc=dynamic_alloc)
+    if ticker.endswith(" Curncy"):
+        data['Signal'] = data['Signal'] * -1 # reverse signal because data is expressed in swap spreads instead of prices
+        if dynamic_alloc:
+            data['Allocation'] = data['Allocation'] * -1 # reverse signal because data is expressed in swap spreads instead of prices
+            data['TradeCost'] = abs(data['Allocation'].diff()).shift(1)*cost*contracts*dv01
+            data['ReturnNoCost'] =  -data[ticker].diff()*100*data['Allocation'].shift(1)*contracts*dv01
+        else:
+            data['TradeCost'] = abs(data['Signal'].diff()).shift(1)*cost*contracts*dv01
+            data['ReturnNoCost'] =  -data[ticker].diff()*100*data['Signal'].shift(1)*contracts*dv01
+    else:
+        if dynamic_alloc:
+            data['TradeCost'] = abs(data['Allocation'].diff()).shift(1)*cost*notional*data['duration']/10000
+            data['ReturnNoCost'] =  data[ticker].diff()/100*data['Allocation'].shift(1)*notional
+        else:
+            data['TradeCost'] = abs(data['Signal'].diff()).shift(1)*cost*notional*data['duration']/10000
+            data['ReturnNoCost'] =  data[ticker].diff()/100*data['Signal'].shift(1)*notional
+    data['DailyReturn'] = data['ReturnNoCost'] - data['TradeCost'] # Generate post-cost PnL (pre-cost - cost)
+    if curr != 'CAD':
+        data['DailyReturn'] = data['DailyReturn' ] * (data[curr].pct_change(fill_method=None) + 1)
+    data['CumulativeReturn'] = data['DailyReturn'].cumsum() # Generate cumulative post-cost PnL
+    if RelativePnL: #Rescale so that PnL is in % format
+        data[['TradeCost','ReturnNoCost','DailyReturn','CumulativeReturn']] = data[['TradeCost','ReturnNoCost','DailyReturn','CumulativeReturn']]/notional    
+    return data.iloc[max(slow_window, slow_slope) + 1:] if momentum_2nd else data.iloc[slow_window:]
+
+
+def cross_over_strategy_long_short(ticker, currency, direction, notional, contracts, dv01, cost, fast_window, slow_window, df, momentum_2nd=False,
+                                   fast_slope=None, slow_slope=None, buffer_2nd=0.0, RelativePnL=False, decay=False, decayrate=None,
+                                   ignore_1st_order=False, dynamic_alloc=False):
+    """
+    Implements a long-short crossover trading strategy using two instruments and calculates associated PnL metrics.
+
+    Parameters:
+    ticker (list of str): List of two ticker symbols to be used in the strategy.
+    currency (list of str): List of the two side's local currencies.
+    direction (list of int): List of two integers (1 or -1) indicating long (1) or short (-1) position for each ticker.
+    notional (list of float): List of notional values for each ticker.
+    contracts (list of int): the number of contracts needed
+    dv01 (list of float): dv01 of each contract
+    cost (float): Trading cost in bps.
+    fast_window (int): Window size for the fast moving average.
+    slow_window (int): Window size for the slow moving average.
+    df (DataFrame): Input DataFrame containing 'Date', mid prices, and durations for each ticker.
+    RelativePnL (bool, optional): If True, scales PnL metrics by total notional to express them in relative terms. Default is False.
+    decay (bool): If True, apply the decay rate to historical differences before MA
+    decayrate (float): The rate to exponentially decay previous data
+
+    Returns:
+    DataFrame: A DataFrame indexed by date with calculated signals, trade costs, pre- and post-cost returns, and cumulative returns.
+    """
+    assert fast_window < slow_window
+    tick = [tic+'_mid' for tic in ticker]
+    dur = [tic+'_Dur' for tic in ticker if not tic.endswith(' Curncy')]
+    curr = list(set([cur for cur in currency if cur != 'CAD']))
+    data = df[['Date']+tick+dur+curr].set_index('Date').sort_index(ascending=True).dropna()
+    data.columns = ticker + dur + curr
+    long_short_name = '_'.join([f"{tick}{'long' if dirc==1 else 'short'}" for tick, dirc in zip(ticker, direction)])
+    data.update({tick: 100 - data[tick] for tick in ticker if tick.endswith(' Curncy')}) # invert UK SONIA swap to generate signals.
+    data[long_short_name] = data[ticker[0]]*direction[0] + data[ticker[1]]*direction[1]
+    if ignore_1st_order:
+        override=True
+        data = momentum_2nd_order(data=data, ticker=long_short_name, fast_slope=fast_slope, slow_slope=slow_slope, buffer_2nd=buffer_2nd, override_sig=override)
+    else:
+        if decay:
+            data['FMA'] = decay_moving_avg(data[long_short_name], fast_window, decayrate=decayrate)
+            data['SMA'] = decay_moving_avg(data[long_short_name], slow_window, decayrate=decayrate)
+        else:
+            data['FMA'] = data[long_short_name].rolling(window=fast_window).mean()
+            data['SMA'] = data[long_short_name].rolling(window=slow_window).mean()
+        data['Signal'] = (data['FMA'] > data['SMA']).astype(int) - (data['FMA'] < data['SMA']).astype(int)
+        if momentum_2nd:
+            data = momentum_2nd_order(data=data, ticker=long_short_name, fast_slope=fast_slope, slow_slope=slow_slope, 
+                                      buffer_2nd=buffer_2nd, dynamic_alloc=dynamic_alloc)
+    # Calculate trade cost and pnl for each leg
+    for idx, tick in enumerate(ticker):
+        if tick.endswith(' Curncy'):
+            if dynamic_alloc:
+                data[f'{tick}_TradeCost'] = abs(data['Allocation'].diff()).shift(1)*cost*abs(contracts[idx])*dv01[idx]
+                data[f'{tick}_ReturnNoCost'] = data[tick].diff()*100*data['Allocation'].shift(1)*contracts[idx]*dv01[idx]
+            else:
+                data[f'{tick}_TradeCost'] = abs(data['Signal'].diff()).shift(1)*cost*abs(contracts[idx])*dv01[idx]
+                data[f'{tick}_ReturnNoCost'] = data[tick].diff()*100*data['Signal'].shift(1)*contracts[idx]*dv01[idx]
+            if currency[idx] != 'CAD':
+                data[f'{tick}_TradeCost'] = data[f'{tick}_TradeCost'] * (data[currency[idx]].pct_change(fill_method=None) + 1)
+                data[f'{tick}_ReturnNoCost'] = data[f'{tick}_ReturnNoCost'] * (data[currency[idx]].pct_change(fill_method=None) + 1)
+        else:
+            if dynamic_alloc:
+                data[f'{tick}_TradeCost'] = abs(data['Allocation'].diff()).shift(1)*cost*abs(notional[idx])*data[f'{tick}_Dur']/10000
+                data[f'{tick}_ReturnNoCost'] = data[tick].diff()/100*data['Allocation'].shift(1)*notional[idx]
+            else:
+                data[f'{tick}_TradeCost'] = abs(data['Signal'].diff()).shift(1)*cost*abs(notional[idx])*data[f'{tick}_Dur']/10000
+                data[f'{tick}_ReturnNoCost'] = data[tick].diff()/100*data['Signal'].shift(1)*notional[idx]
+            if currency[idx] != 'CAD':
+                data[f'{tick}_TradeCost'] = data[f'{tick}_TradeCost'] * (data[currency[idx]].pct_change(fill_method=None) + 1)
+                data[f'{tick}_ReturnNoCost'] = data[f'{tick}_ReturnNoCost'] * (data[currency[idx]].pct_change(fill_method=None) + 1)
+    data['ReturnNoCost'] = data[[f'{tick}_ReturnNoCost'for tick in ticker]].sum(axis=1)
+    data['TradeCost'] = data[[f'{tick}_TradeCost' for tick in ticker]].sum(axis=1)
+    data['DailyReturn'] = data['ReturnNoCost'] - data['TradeCost'] # Generate post-cost PnL (pre-cost - cost)
+    data['CumulativeReturn'] = data['DailyReturn'].cumsum() # Generate cumulative post-cost PnL
+    if RelativePnL: #Rescale so that PnL is in % format
+        data[['TradeCost','ReturnNoCost','DailyReturn','CumulativeReturn']] = data[['TradeCost','ReturnNoCost','DailyReturn','CumulativeReturn']]/max([abs(x) for x in notional])
+    return data.iloc[max(slow_window, slow_slope) + 1:] if momentum_2nd else data.iloc[slow_window:]
+
+
+def cum_rtn_r2(data, time=True, series=None):
+    """
+    Compute R-squared of cumulative return regressed on time or another series.
+
+    Parameters:
+        data (pd.DataFrame): Must contain 'CumulativeReturn' and optionally a custom series.
+        time (bool): If True, regress against time index (converted to numeric). Else, use 'series'.
+        series (str): Column name to regress on if time=False.
+
+    Returns:
+        float: R-squared of the regression.
+    """
+    df = data.copy()
+    if time:
+        df = df[['CumulativeReturn']].dropna()
+        df['Time'] = (df.index - df.index[0]).days.astype(float)
+        X_col = df['Time'].values
+    else:
+        if series is None or series not in df.columns:
+            raise ValueError("Must provide a valid 'series' column name when time=False.")
+        df = df[['CumulativeReturn', series]].dropna()
+        X_col = df[series].values
+    y = df['CumulativeReturn'].values.reshape(-1, 1)
+    X = np.column_stack((np.ones(len(X_col)), X_col.reshape(-1, 1)))
+    XtX_inv = np.linalg.inv(X.T @ X)
+    beta = XtX_inv @ X.T @ y
+    y_hat = X @ beta
+    ssr = np.sum((y - y_hat)**2)
+    sst = np.sum((y - np.mean(y))**2)
+    r_squared = 1 - ssr / sst
+    return r_squared
+
+
+def performance_metrics(data, compound=False, deviation=False, r2=False, dev_r2=False):
+    if data is None or data.empty or 'DailyReturn' not in data.columns:
+        return pd.Series([np.nan]*9, index=[
+            'cumulative return', 'return', 'sharpe', 'deviation from 50', 
+            'mdd', 'R2 positive return', 'sharpe_dev', 'sharpe_r2', 'sharpe_dev_r2'
+        ])
+    try:
+        cum_rtn = data['DailyReturn'].sum()
+        mean_rtn = data['DailyReturn'].mean()
+        std_rtn = data['DailyReturn'].std()
+        sharpe = np.sqrt(252) * mean_rtn / std_rtn if std_rtn != 0 else np.nan
+        try:
+            max_dd = calc_mdd(data, compound=compound)
+        except Exception as e:
+            print("MDD error:", e)
+            max_dd = np.nan
+        if deviation:
+            if 'Signal' not in data.columns:
+                print("Missing 'Signal' column for deviation")
+                dev_from_50 = sharpe_dev = np.nan
+            else:
+                dev_from_50 = abs((data['Signal'] + 1).mean()/2 - 0.5)
+                try:
+                    sharpe_dev = np.mean([relu(sharpe), exp_reg(dev_from_50, 20)])
+                except Exception as e:
+                    print("sharpe_dev error:", e)
+                    sharpe_dev = np.nan
+        else:
+            dev_from_50 = sharpe_dev = np.nan
+        if r2:
+            if cum_rtn > 0:
+                try:
+                    R2_pos_rtn = cum_rtn_r2(data)
+                except Exception as e:
+                    print("R2 calc error:", e)
+                    R2_pos_rtn = np.nan
+            else:
+                R2_pos_rtn = 0
+            sharpe_r2 = np.mean([relu(sharpe), R2_pos_rtn]) if not np.isnan(R2_pos_rtn) else np.nan
+        else:
+            R2_pos_rtn = sharpe_r2 = np.nan
+        if dev_r2:
+            vals = [relu(sharpe)]
+            if not np.isnan(dev_from_50):
+                vals.append(exp_reg(dev_from_50, 10))
+            if not np.isnan(R2_pos_rtn):
+                vals.append(R2_pos_rtn)
+            sharpe_dev_r2 = np.mean(vals) if len(vals) > 1 else np.nan
+        else:
+            sharpe_dev_r2 = np.nan
+        return pd.Series([
+            cum_rtn, mean_rtn, sharpe, dev_from_50, max_dd,
+            R2_pos_rtn, sharpe_dev, sharpe_r2, sharpe_dev_r2
+        ], index=[
+            'cumulative return', 'return', 'sharpe', 'deviation from 50', 
+            'mdd', 'R2 positive return', 'sharpe_dev', 'sharpe_r2', 'sharpe_dev_r2'
+        ])
+    except Exception as e:
+        print("General error:", e)
+        return pd.Series([np.nan]*9, index=[
+            'cumulative return', 'return', 'sharpe', 'deviation from 50', 
+            'mdd', 'R2 positive return', 'sharpe_dev', 'sharpe_r2', 'sharpe_dev_r2'
+        ])
+
+
+# def calc_analytics(data):
+#     """
+#     Calculate trading analytics including returns and Sharpe ratios for different periods.
+
+#     Parameters:
+#     data (DataFrame): The data frame with the price data
+
+#     Returns:
+#     Series: A series with calculated returns and Sharpe ratios
+#     """
+#     colCumRtn = 'CumulativeReturn'
+#     colDlyRtn = 'DailyReturn'
+#     maxDate = data.index.max()
+#     rtn_si = data.loc[maxDate,colCumRtn]
+#     annual_coef = math.sqrt(252) # assuming 252 days a year
+#     daily_risk_free_rate = 0 #480/365  # assuming risk-free rate of 4.8
+#     sharpe_si = annual_coef * (data[colDlyRtn].mean()-daily_risk_free_rate) / data[colDlyRtn].std()
+#     mdd_si = calc_mdd(data)
+#     startDate_1y = maxDate.replace(year = maxDate.year-1)
+#     startDate_1y = data[data.index<startDate_1y].index.max()
+#     if not pd.isnull(startDate_1y):
+#         rtn_1y = rtn_si - data.loc[startDate_1y,colCumRtn]
+#         sharpe_1y = annual_coef * (data[data.index>startDate_1y][colDlyRtn].mean()-daily_risk_free_rate) / data[data.index>startDate_1y][colDlyRtn].std()
+#     else:
+#         rtn_1y = 0
+#         sharpe_1y = 0
+#     mdd_1y = calc_mdd(data[data.index>startDate_1y])
+#     startDate_5y = maxDate.replace(year = maxDate.year-5)
+#     startDate_5y = data[data.index<startDate_5y].index.max()
+#     if not pd.isnull(startDate_5y):
+#         rtn_5y = rtn_si - data.loc[startDate_5y,colCumRtn]
+#         sharpe_5y = annual_coef * (data[data.index>startDate_5y][colDlyRtn].mean()-daily_risk_free_rate) / data[data.index>startDate_5y][colDlyRtn].std()
+#     else:
+#         rtn_5y = 0
+#         sharpe_5y = 0
+#     mdd_5y = calc_mdd(data[data.index>startDate_5y])
+#     startDate_10y = maxDate.replace(year = maxDate.year-10)
+#     startDate_10y = data[data.index<startDate_10y].index.max()
+#     if not pd.isnull(startDate_10y):
+#         rtn_10y = rtn_si - data.loc[startDate_10y,colCumRtn]
+#         sharpe_10y = annual_coef * (data[data.index>startDate_10y][colDlyRtn].mean()-daily_risk_free_rate) / data[data.index>startDate_10y][colDlyRtn].std()
+#     else:
+#         rtn_10y = np.NaN
+#         sharpe_10y = np.NaN
+#     mdd_10y = calc_mdd(data[data.index>startDate_5y])
+#     rtn_blended = np.nanmean((rtn_si, rtn_1y, rtn_5y, rtn_10y))
+#     sharpe_blended = np.nanmean((sharpe_si, sharpe_1y, sharpe_5y, sharpe_10y))
+#     return pd.Series([rtn_si, sharpe_si, mdd_si, startDate_1y, rtn_1y, sharpe_1y, mdd_1y, startDate_5y, rtn_5y, sharpe_5y, mdd_5y, startDate_10y, rtn_10y, sharpe_10y, mdd_10y, rtn_blended, sharpe_blended],
+#                      index=['rtn_si','sharpe_si','mdd_si','startDate_1y','rtn_1y','sharpe_1y','mdd_1y','startDate_5y','rtn_5y','sharpe_5y','mdd_5y','startDate_10y','rtn_10y','sharpe_10y','mdd_10y','rtn_blended','sharpe_blended'])
+
+
+################################################# Window Scenarios #################################################
+class CrossOverScenarios:
+    """
+    Set up maximum windows for fast and slow window selection. Also set up steps in loops.
+    """
+    def __init__(self, fast_start=5, slow_start=20, max_fast=50, max_slow=200, skip=1, 
+                 momentum_2nd=False, ignore_1st_order=False, dynamic_alloc=False,
+                 slowslope_start=None, fastslope_start=None, max_slopefast=None, max_slopeslow=None,
+                 skip_slope=None, buffer_start=0.0, max_buffer=0.0, skip_buffer=None,
+                 deviation=False, r2=False, dev_r2=False):
+        self.fast_start = fast_start
+        self.slow_start = slow_start
+        self.skip = skip
+        self.max_fast = max_fast
+        self.max_slow = max_slow
+        self.momentum_2nd = momentum_2nd
+        self.ignore_1st_order = ignore_1st_order
+        self.dynamic_alloc = dynamic_alloc
+        self.slowslope_start = slowslope_start
+        self.fastslope_start = fastslope_start
+        self.skip_slope = skip_slope
+        self.max_slopefast = max_slopefast
+        self.max_slopeslow = max_slopeslow
+        self.skip_buffer = skip_buffer
+        self.buffer_start = buffer_start
+        self.max_buffer = max_buffer
+        self.deviation = deviation
+        self.r2 = r2
+        self.dev_r2 = dev_r2
+
+    def _frange(self, start, stop, step):
+        if step == 0:
+            if start == stop:
+                yield round(start, 10)
+            else:
+                raise ValueError("Step size cannot be zero unless start == stop")
+        elif start == stop:
+            yield round(start, 10)
+        else:
+            while start < stop:
+                yield round(start, 10)
+                start += step
+
+    def futures_simplified(self, ticker, currency, notional, contracts, dv01, cost, df,
+                        RelativePnL=False, decay=False, decayrate=None):
+        if len(df) <= self.fast_start:
+            return None
+        pnls = pd.DataFrame(range(self.slow_start, self.max_slow + 1, self.skip), columns=['slow_window'])
+        pnls['fast_window'] = pnls['slow_window'].apply(
+            lambda val: range(self.fast_start, min(val // 2, self.max_fast) + 1, self.skip)
+        )
+        pnls = pnls.explode('fast_window', ignore_index=True)
+        if self.momentum_2nd or self.ignore_1st_order:
+            slope_fast_vals = list(range(self.fastslope_start, self.max_slopefast + 1, self.skip_slope))
+            slope_slow_vals = list(range(self.slowslope_start, self.max_slopeslow + 1, self.skip_slope))
+            buffer_vals = [round(i, 10) for i in self._frange(self.buffer_start, self.max_buffer + 0.01, self.skip_buffer)]
+            slope_combos = pd.DataFrame(
+                [(sf, ss, b) for sf in slope_fast_vals for ss in slope_slow_vals for b in buffer_vals if sf < ss],
+                columns=['fast_slope', 'slow_slope', 'buffer']
+            )
+            if self.ignore_1st_order:
+                slope_combos = slope_combos.drop_duplicates(subset=['fast_slope', 'slow_slope'])
+            pnls = pnls.assign(key=1).merge(slope_combos.assign(key=1), on='key').drop('key', axis=1)
+        def calc_metrics(row):
+            return performance_metrics(
+                cross_over_strategy(
+                    ticker=ticker,
+                    curr=currency,
+                    notional=notional,
+                    contracts=contracts,
+                    dv01=dv01,
+                    cost=cost,
+                    fast_window=row['fast_window'],
+                    slow_window=row['slow_window'],
+                    df=df,
+                    RelativePnL=RelativePnL,
+                    decay=decay,
+                    decayrate=decayrate,
+                    momentum_2nd=self.momentum_2nd,
+                    dynamic_alloc=self.dynamic_alloc,
+                    ignore_1st_order=self.ignore_1st_order,
+                    fast_slope=row.get('fast_slope'),
+                    slow_slope=row.get('slow_slope'),
+                    buffer_2nd=row.get('buffer')
+                ),
+                deviation=self.deviation,
+                r2=self.r2,
+                dev_r2=self.dev_r2
+            )
+        pnls[[
+            'cumulative return', 'return', 'sharpe', 'deviation from 50', 'mdd', 'R2 positive rtn',
+            'sharpe_dev', 'sharpe_r2', 'sharpe_dev_r2'
+        ]] = pnls.apply(calc_metrics, axis=1, result_type='expand')
+        return pnls
+
+    def long_short_simplified(self, ticker, currency, direction, notional, contracts, dv01, cost, df, 
+                            RelativePnL=False, decay=False, decayrate=None):
+        if len(df) <= self.fast_start:
+            return None
+        pnls = pd.DataFrame(range(self.slow_start, self.max_slow + 1, self.skip), columns=['slow_window'])
+        pnls['fast_window'] = pnls['slow_window'].apply(
+            lambda val: range(self.fast_start, min(val // 2, self.max_fast) + 1, self.skip)
+        )
+        pnls = pnls.explode('fast_window', ignore_index=True)
+        if self.momentum_2nd or self.ignore_1st_order:
+            slope_fast_vals = list(range(self.fastslope_start, self.max_slopefast + 1, self.skip_slope))
+            slope_slow_vals = list(range(self.slowslope_start, self.max_slopeslow + 1, self.skip_slope))
+            buffer_vals = [round(i, 10) for i in self._frange(self.buffer_start, self.max_buffer + 0.01, self.skip_buffer)]
+            slope_combos = pd.DataFrame(
+                [(sf, ss, b) for sf in slope_fast_vals for ss in slope_slow_vals for b in buffer_vals if sf < ss],
+                columns=['fast_slope', 'slow_slope', 'buffer']
+            )
+            if self.ignore_1st_order:
+                slope_combos = slope_combos.drop_duplicates(subset=['fast_slope', 'slow_slope'])
+            pnls = pnls.assign(key=1).merge(slope_combos.assign(key=1), on='key').drop('key', axis=1)
+        def calc_metrics(row):
+            return performance_metrics(
+                cross_over_strategy_long_short(
+                    ticker=ticker,
+                    currency=currency,
+                    direction=direction,
+                    notional=notional,
+                    contracts=contracts,
+                    dv01=dv01,
+                    cost=cost,
+                    fast_window=row['fast_window'],
+                    slow_window=row['slow_window'],
+                    df=df,
+                    RelativePnL=RelativePnL,
+                    decay=decay,
+                    decayrate=decayrate,
+                    momentum_2nd=self.momentum_2nd,
+                    dynamic_alloc=self.dynamic_alloc,
+                    ignore_1st_order=self.ignore_1st_order,
+                    fast_slope=row.get('fast_slope'),
+                    slow_slope=row.get('slow_slope'),
+                    buffer_2nd=row.get('buffer')
+                ),
+                deviation=self.deviation,
+                r2=self.r2,
+                dev_r2=self.dev_r2
+            )
+        pnls[[
+            'cumulative return', 'return', 'sharpe', 'deviation from 50', 'mdd', 'R2 positive rtn',
+            'sharpe_dev', 'sharpe_r2', 'sharpe_dev_r2'
+        ]] = pnls.apply(calc_metrics, axis=1, result_type='expand')
+        return pnls
+
+
+    # def futures_full(self, ticker, currency, notional, contracts, dv01, cost, df, RelativePnL=False, decay=False, decayrate=None):
+    #     """
+    #     Implement a crossover strategy with various window sizes and calculate trading metrics to find the best windows.
+    
+    #     Parameters:
+    #     ticker (str): The ticker symbol
+    #     currency (str): The security's local currency
+    #     notional (float): The notional value of the investment
+    #     cost (float): The cost of trading
+    #     contracts (int): the number of contracts needed
+    #     dv01 (float): dv01 of each contract
+    #     df (DataFrame): The data frame with the price data
+    #     decay (bool): If True, apply the decay rate to historical differences before MA
+    #     decayrate (float): The rate to exponentially decay previous data
+
+    #     Returns:
+    #     DataFrame: The data frame with calculated metrics for each window size
+    #     """
+    #     pnls = pd.DataFrame(range(20,self.max_slow+1,self.skip), columns=['slow_window'])
+    #     pnls['fast_window'] = pnls['slow_window'].apply(lambda val: range(5,min(val//2,self.max_fast)+1,self.skip))
+    #     pnls = pnls.explode('fast_window', ignore_index=True)
+    #     pnls[['rtn_si','sharpe_si','mdd_si','startDate_1y','rtn_1y','sharpe_1y','mdd_1y','startDate_5y','rtn_5y','sharpe_5y','mdd_5y','startDate_10y','rtn_10y','sharpe_10y','mdd_10y','rtn_blended','sharpe_blended']] = pnls[['fast_window','slow_window']].apply(lambda x: calc_analytics(cross_over_strategy(ticker, currency, notional, contracts, dv01, cost, x.iloc[0], x.iloc[1], df, RelativePnL, decay=decay, decayrate=decayrate)), axis=1, result_type='expand')
+    #     return pnls
+    
+    # def long_short_full(self, ticker, currency, direction, notional, contracts, dv01, cost, df, RelativePnL=False, decay=False, decayrate=None):
+    #     """
+    #     Implement a crossover strategy with various window sizes and calculate trading metrics to find the best windows.
+    
+    #     Parameters:
+    #     ticker (list of str): List of two ticker symbols to be used in the strategy.
+    #     currency (list of str): The two securities' local currencies.
+    #     direction (list of int): List of two integers (1 or -1) indicating long (1) or short (-1) position for each ticker.
+    #     notional (list of float): List of notional values for each ticker.
+    #     cost (float): Trading cost in bps.
+    #     df (DataFrame): Input DataFrame containing 'Date', mid prices, and durations for each ticker.
+    #     RelativePnL (bool, optional): If True, scales PnL metrics by total notional to express them in relative terms. Default is False.
+    #     decay (bool): If True, apply the decay rate to historical differences before MA
+    #     decayrate (float): The rate to exponentially decay previous data
+    
+    #     Returns:
+    #     DataFrame: The data frame with calculated metrics for each window size
+    #     """
+    #     pnls = pd.DataFrame(range(20,self.max_slow+1,self.skip), columns=['slow_window'])
+    #     pnls['fast_window'] = pnls['slow_window'].apply(lambda val: range(5,min(val//2,self.max_fast)+1,self.skip))
+    #     pnls = pnls.explode('fast_window', ignore_index=True)
+    #     pnls[['rtn_si','sharpe_si','mdd_si','startDate_1y','rtn_1y','sharpe_1y','mdd_1y','startDate_5y','rtn_5y','sharpe_5y','mdd_5y','startDate_10y','rtn_10y','sharpe_10y','mdd_10y','rtn_blended','sharpe_blended']] = pnls[['fast_window','slow_window']].apply(lambda x: calc_analytics(cross_over_strategy_long_short(ticker, currency, direction, notional, contracts, dv01, cost, x.iloc[0], x.iloc[1], df, RelativePnL, decay=decay, decayrate=decayrate)), axis=1, result_type='expand')
+    #     return pnls
