@@ -1,0 +1,440 @@
+import os
+from support_codes.model_selection import *
+from support_codes.consolidate_portfolio import *
+
+##################################################### SETTINGS #####################################################
+# Backtest Settings
+AmountInvested = 100000000 # Target notional in CAD
+dv01_budget = 27000 # In CAD
+trade_cost = 0.20 # In bps
+trade_cost_LS = 0.15 # In bps
+fix_fx = True # Toggle to keep FX rates fixed
+
+# Cross Over Scenarios Engine Settings
+PlainEngine = CrossOverScenarios(max_fast=50, max_slow=200, skip=1)
+LSEngine = CrossOverScenarios(max_fast=100, max_slow=300, skip=2)
+relativePnL = True # Toggle to generate returns in % or in $Amt
+
+# Data Source and Filepath Settings
+bbg_data = False #Toggle to pull from BBG API or pull data from Excel files
+path = os.getcwd()
+data_path = os.path.join(path, 'Data', 'futures data.xlsx') # Comment out if pulling directly from BBG
+fx_path = os.path.join(path, 'Data', 'DM FX data.xlsx') # Comment out if pulling directly from BBG
+rates_path = os.path.join(path, 'Data', 'DM rates history.xlsx') # Comment out if pulling directly from BBG
+
+# Pandas Settings
+pd.set_option('mode.chained_assignment', None) # Disable pandas warning for not modifying original dataframe
+pd.set_option('expand_frame_repr', False) # Print dataframes in a single line if it fits
+pd.set_option('display.max_columns', 15) # Truncate middle columns if len(df.columns) > 15
+
+
+##################################################### LOADING DATA #####################################################
+############################################## IGNORE IF PULLING FROM BBG ##############################################
+if bbg_data:
+    from support_codes.bbg import *
+else:
+    sheet_names = pd.ExcelFile(data_path).sheet_names
+    data = pd.DataFrame(columns=['Date'])
+    for sheet in sheet_names[1:]:
+        df = pd.read_excel(data_path, sheet_name=sheet, engine='openpyxl')
+        if sheet.endswith(" Curncy"):
+            df = df[['Date', 'PX_LAST', 'PX_BID', 'PX_ASK']]
+            df.columns = ['Date', f'{sheet}_mid', f'{sheet}_bid', f'{sheet}_ask']
+        else:
+            df = df[['Date', 'PX_LAST', 'PX_BID', 'PX_ASK', 'FUT_EQV_DUR_NOTL']]
+            df.columns = ['Date', f'{sheet}_mid', f'{sheet}_bid', f'{sheet}_ask', f'{sheet}_Dur']
+        df['Date'] = pd.to_datetime(df['Date'])
+        data = pd.merge(data, df, on='Date', how='outer')
+
+    sheet_names = pd.ExcelFile(fx_path).sheet_names
+    for sheet in sheet_names:
+        df = pd.read_excel(fx_path, sheet_name=sheet, engine='openpyxl')
+        df.columns = ['Date', f'{sheet}']
+        df['Date'] = pd.to_datetime(df['Date'])
+        data = pd.merge(data, df, on='Date', how='outer')
+
+#    data_is = data[data['Date'] <= '2022-01-01']
+#    data_oos = data[data['Date'] >= '2022-01-02']
+    data_pre = data[data['Date'] < '2008-01-01']
+#    data = data[data['Date'] <= '2025-04-30']
+    data[['SFR_Dur','SFR_offset1_Dur','SFR_offset2_Dur','SFR_offset3_Dur','SER_Dur','SER_offset1_Dur','SER_offset2_Dur',
+          'SER_offset3_Dur','COR_Dur','COR_offset1_Dur','COR_offset2_Dur','COR_offset3_Dur','OOR_Dur','SFI_Dur','SFI_offset1_Dur',
+          'SFI_offset2_Dur','SFI_offset3_Dur','ER_Dur','ER_offset1_Dur','ER_offset2_Dur','ER_offset3_Dur']] = 1
+
+##################################################### CURRENT STRATEGY #####################################################
+OldDescs = [('TU', 'CAD', 1.9159, float("nan"), float("nan"), 1.397, 200000, 10, 50, 10, 50, 0.0), #US 2yr
+            ('FV', 'CAD', 4.4194, float("nan"), float("nan"), 1.397, 100000, 10, 50, 10, 50, 0.0), #US 5yr
+            ('CV', 'CAD', 1.917, float("nan"), float("nan"), 1.000, 100000, 10, 60, 10, 50, 0.0), #CA 2yr
+            ('XQ', 'CAD', 4.4424, float("nan"), float("nan"), 1.000, 100000, 10, 60, 10, 50, 0.0), #CA 5yr
+            ('DU', 'CAD', 1.9453, float("nan"), float("nan"), 1.568, 100000, 10, 120, 10, 50, 0.0), #EU 2yr
+            ('OE', 'CAD', 4.5144, float("nan"), float("nan"), 1.568, 100000, 10, 120, 10, 50, 0.0), #EU 5yr
+            ('BPSWS2 Curncy', 'CAD', 1.918, float("nan"), float("nan"), 1.8592, 100000, 20, 110, 10, 50, 0.0), #UK 2yr SONIA
+            ('BPSWS5 Curncy', 'CAD', 4.532, float("nan"), float("nan"), 1.8592, 100000, 20, 110, 10, 50, 0.0), #UK 5yr SONIA
+            ]
+
+port_old = PortfolioMomentum(OldDescs, dv01_budget, AmountInvested, trade_cost, data, 'futures', relativePnL=relativePnL)
+print(performance_metrics(port_old.consolidate_rtns()[port_old.consolidate_rtns().index>='2008-01-01'], r2=True))
+#port_old.plot_against_HFRIMTF(maxLev=5, startdate='2008-01-01')
+a = port_old.compare_HFRIMTF(maxLev=5)
+a.loc['2025-05-31', 'HFRIMTF MonRtn'] = -0.0072
+a.loc['2025-06-30', 'HFRIMTF MonRtn'] = 0.0091
+plot_cum_rtns(a[a.index>='2008-01-01'], dotted_series='HFRIMTF MonRtn')
+
+pnls = port_old.run_portfolio()
+for key in pnls.keys():
+    print(key)
+    print(performance_metrics(pnls[key][pnls[key].index>='2008-01-01']))
+    # print(calc_analytics(pnls[key][pnls[key].ikundex>='2008-01-01'])['sharpe_blended'])
+    print(calc_avg_hold(pnls[key]))
+#    plot_cum_rtns(pd.DataFrame(pnls[key]['DailyReturn'][pnls[key].index>='2008-01-01']))
+
+
+##################################################### CV WINDOWS #####################################################
+CurDescs = [('TU', 'CAD', 1.9159, float("nan"), float("nan"), 1.397, 200000, 40, 105, 45, 80, 0.5), #US 2yr
+            ('FV', 'CAD', 4.4194, float("nan"), float("nan"), 1.397, 100000, 15, 150, 20, 80, 0.5), #US 5yr
+            ('CV', 'CAD', 1.917, float("nan"), float("nan"), 1.000, 100000, 25, 70, 50, 65, 0.5), #CA 2yr
+            ('XQ', 'CAD', 4.4424, float("nan"), float("nan"), 1.000, 100000, 30, 90, 35, 95, 0.5), #CA 5yr
+            ('DU', 'CAD', 1.9453, float("nan"), float("nan"), 1.568, 100000, 45, 150, 20, 35, 0.5), #EU 2yr
+            ('OE', 'CAD', 4.5144, float("nan"), float("nan"), 1.568, 100000, 35, 90, 20, 25, 0.5), #EU 5yr
+            ('BPSWS2 Curncy', 'CAD', 1.918, float("nan"), float("nan"), 1.8592, 100000, 35, 120, 45, 125, 0.5), #UK 2yr SONIA (ContractSize is a dummy for compatibility)
+            ('BPSWS5 Curncy', 'CAD', 4.532, float("nan"), float("nan"), 1.8592, 100000, 35, 90, 40, 85, 0.5), #UK 5yr SONIA (ContractSize is a dummy for compatibility)
+            ]
+
+port = PortfolioMomentum(CurDescs, dv01_budget, AmountInvested, trade_cost, data, 'futures', relativePnL=relativePnL,
+                         decay=False, decayrate=0.005, conditional_decay=True, condition=[100,180], momentum_2nd_order=True, 
+                         dynamic_alloc=True)
+print(performance_metrics(port.consolidate_rtns()[port.consolidate_rtns().index>='2008-01-01'],deviation=False, r2=True, dev_r2=False))
+# port.plot_against_HFRIMTF(maxLev=5, startdate='2008-01-01')
+b = port.compare_HFRIMTF(maxLev=5)
+b.loc['2025-05-31', 'HFRIMTF MonRtn'] = -0.0072
+b.loc['2025-06-30', 'HFRIMTF MonRtn'] = 0.0091
+plot_cum_rtns(b[b.index>='2008-01-01'], dotted_series='HFRIMTF MonRtn')
+
+pnls = port.run_portfolio()
+for key in pnls.keys():
+    print(key)
+    print((pnls[key]['Signal']==1).sum()/pnls[key]['Signal'].abs().sum())
+    print(performance_metrics(pnls[key][pnls[key].index>='2008-01-01']))
+    # print(calc_analytics(pnls[key][pnls[key].index>='2008-01-01'])['sharpe_blended'])
+    print(calc_avg_hold(pnls[key]))
+#    plot_cum_rtns(pd.DataFrame(pnls[key]['DailyReturn'][pnls[key].index>='2008-01-01']))
+
+# Using rolling MVO
+# port.calculate_rolling_results(min_w=0.02)
+# print(performance_metrics(port.rolling_mvo_results[port.rolling_mvo_results.index>='2008-01-01']))
+# port.plot_against_HFRIMTF(maxLev=5, startdate='2008-01-01', rolling_mvo=True)
+
+
+
+##################################################### ALL FUTURES #####################################################
+FutDescs = [('TU', 'CAD', 1.9159, float("nan"), float("nan"), 1.397, 200000, 40, 105, 45, 80, 0.5), #US 2yr
+            ('FV', 'CAD', 4.4194, float("nan"), float("nan"), 1.397, 100000, 15, 150, 20, 80, 0.5), #US 5yr
+            # ('TY', 'CAD', 7.7915, float("nan"), float("nan"), 1.397, 100000, 35, 85, 20, 55, 0.5), #US 10yr
+            ('UXY', 'CAD', 7.8153, float("nan"), float("nan"), 1.397, 100000, 25, 50, 30, 35, 0.5), #US ultra 10yr
+            ('CV', 'CAD', 1.917, float("nan"), float("nan"), 1.000, 100000, 25, 70, 50, 65, 0.5), #CA 2yr
+            ('XQ', 'CAD', 4.4424, float("nan"), float("nan"), 1.000, 100000, 30, 90, 35, 95, 0.5), #CA 5yr
+            # ('CN', 'CAD', 7.9259, float("nan"), float("nan"), 1.000, 100000, 15, 60, 20, 35, 0.5), #CA 10yr
+            ('DU', 'CAD', 1.9453, float("nan"), float("nan"), 1.568, 100000, 45, 150, 20, 35, 0.5), #EU 2yr
+            ('OE', 'CAD', 4.5144, float("nan"), float("nan"), 1.568, 100000, 35, 90, 20, 25, 0.5), #EU 5yr
+            ('BPSWS2 Curncy', 'CAD', 1.918, float("nan"), float("nan"), 1.8592, 100000, 35, 120, 45, 125, 0.5), #UK 2yr SONIA (ContractSize is a dummy for compatibility)
+            ('BPSWS5 Curncy', 'CAD', 4.532, float("nan"), float("nan"), 1.8592, 100000, 35, 90, 40, 85, 0.5), #UK 5yr SONIA (ContractSize is a dummy for compatibility)
+            ('BPSWS10 Curncy', 'CAD', 8.187, float("nan"), float("nan"), 1.8592, 100000, 35, 120, 40, 60, 0.5), #UK 10yr SONIA (ContractSize is a dummy for compatibility)
+            ('SFR_offset2', 'CAD', 1, float("nan"), float("nan"), 1.397, 250000, 25, 50, 40, 100, 0.5), #3m SOFR, rolled into 3rd contract
+            ('COR_offset2', 'CAD', 1, float("nan"), float("nan"), 1.000, 250000, 40, 200, 40, 85, 0.5), #3m CORRA, rolled into 3rd contract
+            ('SFI_offset2', 'CAD', 1, float("nan"), float("nan"), 1.8592, 250000, 25, 80, 10, 145, 0.5), #3m SONIA, rolled into 3rd contract
+            ('ER_offset2', 'CAD', 1, float("nan"), float("nan"), 1.5681, 250000, 35, 150, 30, 135, 0.5), #3m EURIBOR, rolled into 3rd contract
+            ]
+
+port_fut = PortfolioMomentum(FutDescs, dv01_budget, AmountInvested, trade_cost, data, 'futures', relativePnL=relativePnL,
+                             decay=False, decayrate=0.005, conditional_decay=True, condition=[100,180], momentum_2nd_order=True,
+                             dynamic_alloc=False)
+print(performance_metrics(port_fut.consolidate_rtns()[port_fut.consolidate_rtns().index>='2008-01-01'], deviation=False, r2=True, dev_r2=False))
+# port_fut.plot_against_HFRIMTF(maxLev=5, startdate='2008-01-01')
+c = port_fut.compare_HFRIMTF(maxLev=5)
+c.loc['2025-05-31', 'HFRIMTF MonRtn'] = -0.0072
+c.loc['2025-06-30', 'HFRIMTF MonRtn'] = 0.0091
+plot_cum_rtns(c[c.index>='2008-01-01'], dotted_series='HFRIMTF MonRtn')
+
+pnls = port_fut.run_portfolio()
+avg_long = []
+avg_hold = []
+for key in pnls.keys():
+    print(key)
+    print(performance_metrics(pnls[key][pnls[key].index>='2008-01-01'], deviation=True, r2=True, dev_r2=True))
+    avg_long.append(((pnls[key][pnls[key].index>='2008-01-01']['Signal']+1)/2).mean())
+    # print(calc_analytics(pnls[key][pnls[key].index>='2008-01-01'])['sharpe_blended'])
+    avg_hold.append(calc_avg_hold(pnls[key][pnls[key].index>='2008-01-01']))
+    plot_cum_rtns(pd.DataFrame(pnls[key]['DailyReturn'][pnls[key].index>='2008-01-01']))
+print(np.mean(avg_long))
+print(np.mean(avg_hold))
+
+# Using rolling MVO on newly selected securites
+# port_fut.calculate_rolling_results(min_w=0.02)
+# print(performance_metrics(port_fut.rolling_mvo_results[port_fut.rolling_mvo_results.index>='2008-01-01']))
+# port_fut.plot_against_HFRIMTF(maxLev=5, startdate='2008-01-01', rolling_mvo=True)
+
+
+##################################################### CHOSEN SPREADS #####################################################
+#ticker, ccy, CurrentDuration, Direction, Pair#, Weight, MV/Contract, FXRate, ContractSizeLocal
+LongShortDescs = [
+                ('TU', 'CAD', 1, 1, 1.9159, float("nan"), float("nan"), 1.397, 200000), #long US 2yr
+                ('TY', 'CAD', -1, 1, 7.7915, float("nan"), float("nan"), 1.397, 100000), #short US 10yr
+                ('CV', 'CAD', 1, 2, 1.917, float("nan"), float("nan"), 1.000, 100000), #long CA 2yr
+                ('CN', 'CAD', -1, 2, 7.9259, float("nan"), float("nan"), 1.000, 100000), #short CA 10yr
+                # ('DU', 'CAD', 1, 3, 1.9453, float("nan"), float("nan"), 1.568, 100000), #long EU 2yr
+                # ('RX', 'CAD', -1, 3, 8.1062, float("nan"), float("nan"), 1.568, 100000), #short EU 10yr
+                # ('BPSWS2 Curncy', 'CAD', 1, 4, 1.918, float("nan"), float("nan"), 1.8592, 100000), #long UK 2yr SONIA (ContractSize is a dummy for compatibility)
+                # ('BPSWS10 Curncy', 'CAD', -1, 4, 8.187, float("nan"), float("nan"), 1.8592, 100000), #short UK 10yr SONIA (ContractSize is a dummy for compatibility)
+                ('TU', 'CAD', 1, 5, 1.9159, float("nan"), float("nan"), 1.397, 200000, 10, 50), #long US 2yr
+                ('CV', 'CAD', -1, 5, 1.917, float("nan"), float("nan"), 1.000, 100000, 10, 50), #short CA 2yr
+                # ('TU', 'CAD', 1, 6, 1.9159, float("nan"), float("nan"), 1.397, 200000, 10, 50), #long US 2yr
+                # ('DU', 'CAD', -1, 6, 1.9453, float("nan"), float("nan"), 1.568, 100000, 10, 50), #short EU 2yr
+                # ('TU', 'CAD', 1, 7, 1.9159, float("nan"), float("nan"), 1.397, 200000, 10, 50), #long US 2yr
+                # ('BPSWS2 Curncy', 'CAD', -1, 7, 1.918, float("nan"), float("nan"), 1.8592, 100000, 20, 110), #short UK 2yr SONIA
+                ('CV', 'CAD', 1, 8, 1.917, float("nan"), float("nan"), 1.000, 100000, 10, 50), #long CA 2yr
+                ('DU', 'CAD', -1, 8, 1.9453, float("nan"), float("nan"), 1.568, 100000, 10, 50), #short EU 2yr
+                # ('CV', 'CAD', 1, 9, 1.917, float("nan"), float("nan"), 1.000, 100000, 10, 50), #long CA 2yr
+                # ('BPSWS2 Curncy', 'CAD', -1, 9, 1.918, float("nan"), float("nan"), 1.8592, 100000, 20, 110), #short UK 2yr SONIA
+                ('DU', 'CAD', 1, 10, 1.9453, float("nan"), float("nan"), 1.568, 100000, 10, 50), #long EU 2yr
+                ('BPSWS2 Curncy', 'CAD', -1, 10, 1.918, float("nan"), float("nan"), 1.8592, 100000, 20, 110), #short UK 2yr SONIA
+                # ('FV', 'CAD', 1, 11, 4.4194, float("nan"), float("nan"), 1.397, 100000, 10, 50), #long US 5yr
+                # ('XQ', 'CAD', -1, 11, 4.4424, float("nan"), float("nan"), 1.000, 100000, 10, 60), #short CA 5yr
+                # ('FV', 'CAD', 1, 12, 4.4194, float("nan"), float("nan"), 1.397, 100000, 10, 50), #long US 5yr
+                # ('OE', 'CAD', -1, 12, 4.5144, float("nan"), float("nan"), 1.568, 100000, 10, 120), #short EU 5yr
+                # ('FV', 'CAD', 1, 13, 4.4194, float("nan"), float("nan"), 1.397, 100000, 10, 50), #long US 5yr
+                # ('BPSWS5 Curncy', 'CAD', -1, 13, 4.532, float("nan"), float("nan"), 1.8592, 100000, 20, 110), #short UK 5yr SONIA
+                # ('XQ', 'CAD', 1, 14, 4.4424, float("nan"), float("nan"), 1.000, 100000, 10, 60), #long CA 5yr
+                # ('OE', 'CAD', -1, 14, 4.5144, float("nan"), float("nan"), 1.568, 100000, 10, 120), #short EU 5yr
+                # ('XQ', 'CAD', 1, 15, 4.4424, float("nan"), float("nan"), 1.000, 100000, 10, 60), #long CA 5yr
+                # ('BPSWS5 Curncy', 'CAD', -1, 15, 4.532, float("nan"), float("nan"), 1.8592, 100000, 20, 110), #short UK 5yr SONIA
+                # ('OE', 'CAD', 1, 16, 4.5144, float("nan"), float("nan"), 1.568, 100000, 10, 120), #long EU 5yr
+                # ('BPSWS5 Curncy', 'CAD', -1, 16, 4.532, float("nan"), float("nan"), 1.8592, 100000, 20, 110), #short UK 5yr SONIA
+                # ('TY', 'CAD', 1, 17, 7.7915, float("nan"), float("nan"), 1.397, 100000, 10, 50), #long US 10yr
+                # ('CN', 'CAD', -1, 17, 7.9259, float("nan"), float("nan"), 1.000, 100000, 10, 60), #short CA 10yr
+                # ('TY', 'CAD', 1, 18, 7.7915, float("nan"), float("nan"), 1.397, 100000, 10, 50), #long US 10yr
+                # ('RX', 'CAD', -1, 18, 8.1062, float("nan"), float("nan"), 1.568, 100000, 10, 120), #short EU 10yr
+                ('TY', 'CAD', 1, 19, 7.7915, float("nan"), float("nan"), 1.397, 100000, 10, 50), #long US 10yr
+                ('BPSWS10 Curncy', 'CAD', -1, 19, 8.187, float("nan"), float("nan"), 1.8592, 100000, 20, 110), #short UK 10yr SONIA
+                # ('CN', 'CAD', 1, 20, 7.9259, float("nan"), float("nan"), 1.000, 100000, 10, 60), #long CA 10yr
+                # ('RX', 'CAD', -1, 20, 8.1062, float("nan"), float("nan"), 1.568, 100000, 10, 120), #short EU 10yr
+                # ('CN', 'CAD', 1, 21, 7.9259, float("nan"), float("nan"), 1.000, 100000, 10, 60), #long CA 10yr
+                # ('BPSWS10 Curncy', 'CAD', -1, 21, 8.187, float("nan"), float("nan"), 1.8592, 100000, 20, 110), #short UK 10yr SONIA
+                ('RX', 'CAD', 1, 22, 8.1062, float("nan"), float("nan"), 1.568, 100000, 10, 120), #long EU 10yr
+                ('BPSWS10 Curncy', 'CAD', -1, 22, 8.187, float("nan"), float("nan"), 1.8592, 100000, 20, 110), #short UK 10yr SONIA
+                ('SFR_offset2', 'CAD', 1, 23, 1, float("nan"), float("nan"), 1.397, 250000, 10, 50), #long 3m SOFR
+                ('COR_offset2', 'CAD', -1, 23, 1, float("nan"), float("nan"), 1.000, 250000, 10, 60), #short 3m CORRA
+                # ('SFR_offset2', 'CAD', 1, 24, 1, float("nan"), float("nan"), 1.397, 250000), #long 3m SOFR
+                # ('SFI_offset2', 'CAD', -1, 24, 1, float("nan"), float("nan"), 1.8592, 250000), #short 3m SONIA
+                ('COR_offset2', 'CAD', 1, 25, 1, float("nan"), float("nan"), 1.000, 250000), #long 3m CORRA
+                ('SFI_offset2', 'CAD', -1, 25, 1, float("nan"), float("nan"), 1.8592, 250000), #short 3m SONIA
+                ('ER_offset2', 'CAD', 1, 26, 1, float("nan"), float("nan"), 1.5681, 250000), #long 3m EURIBOR
+                ('SFI_offset2', 'CAD', -1, 26, 1, float("nan"), float("nan"), 1.8592, 250000), #short 3m SONIA
+                # ('SFR_offset2', 'CAD', 1, 27, 1, float("nan"), float("nan"), 1.397, 250000), #long 3m SOFR
+                # ('ER_offset2', 'CAD', -1, 27, 1, float("nan"), float("nan"), 1.5681, 250000), #short 3m EURIBOR
+                # ('COR_offset2', 'CAD', 1, 28, 1, float("nan"), float("nan"), 1.000, 250000), #long 3m CORRA
+                # ('ER_offset2', 'CAD', -1, 28, 1, float("nan"), float("nan"), 1.5681, 250000), #short 3m EURIBOR
+                  ]
+
+ls_windows = {
+              1: [35, 80, 20, 55, 0.5], #TU-TY window
+              2: [25, 200, 20, 35, 0.5], #CV-CN window
+              3: [35, 70, 10, 15, 0.0], #DU-RX window
+              4: [40, 90, 20, 65, 0.5], #BPSWS2-BPSWS10 window
+              5: [25, 60, 40, 55, 0.5], #TU-CV window
+              6: [35, 150, 30, 50, 0.0], #TU-DU window
+              7: [35, 100, 30, 55, 0.5], #TU-BPSWS2 window
+              8: [35, 130, 50, 105, 0.5], #CV-DU window
+              9: [35, 110, 50, 65, 0.5], #CV-BPSWS2 window
+              10: [25, 200, 40, 65, 0.5], #DU-BPSWS2 window
+              11: [15, 200, 40, 145, 0.5], #FV-XQ window
+              12: [45, 190, 40, 115, 0.0], #FV-OE window
+              13: [40, 160, 50, 115, 0.5], #FV-BPSWS5 window
+              14: [25, 100, 50, 55, -0.5], #XQ-OE window
+              15: [40, 180, 50, 145, 0.5], #XQ-BPSWS5 window
+              16: [45, 180, 50, 115, 0.5], #OE-BPSWS5 window
+              17: [35, 110, 40, 65, 0.5], #TY-CN window
+              18: [25, 130, 30, 45, 0.5], #TY-RX window
+              19: [35, 80, 30, 35, 0.5], #TY-BPSWS10 window
+              20: [35, 120, 50, 55, 0.5], #CN-RX window
+              21: [25, 150, 30, 75, 0.5], #CN-BPSWS10 window
+              22: [45, 200, 50, 135, 0.0], #RX-BPSWS10 window
+              23: [25, 200, 10, 25, 0.0], #SFR-COR 2 window
+              24: [25, 120, 40, 50, 0.0], #SFR-SFI 2 window
+              25: [30, 130, 10, 25, 0.0], #COR-SFI 2 window
+              26: [35, 70, 50, 75, 0.5], #ER-SFI 2 window
+              27: [10, 180, 30, 55, 0.5], #SFR-ER 2 window
+              28: [10, 180, 30, 40, 0.5], #COR-ER 2 window
+              }
+
+port_ls = PortfolioMomentum(LongShortDescs, dv01_budget, AmountInvested, trade_cost_LS, data, 'long_short', relativePnL=relativePnL,
+                             decay=False, ls_windows=ls_windows, decayrate=0.005, conditional_decay=True, condition=[100,180], momentum_2nd_order=True,
+                             dynamic_alloc=False)
+print(performance_metrics(port_ls.consolidate_rtns()[port_ls.consolidate_rtns().index>='2008-01-01'], deviation=False, r2=True, dev_r2=False))
+# port_ls.plot_against_HFRIMTF(maxLev=5, startdate='2008-01-01')
+d = port_ls.compare_HFRIMTF(maxLev=5)
+d.loc['2025-05-31', 'HFRIMTF MonRtn'] = -0.0072
+d.loc['2025-06-30', 'HFRIMTF MonRtn'] = 0.0091
+plot_cum_rtns(d[d.index>='2008-01-01'], dotted_series='HFRIMTF MonRtn')
+
+pnls = port_ls.run_portfolio()
+avg_long = []
+avg_hold = []
+for key in pnls.keys():
+    print(key)
+    print(performance_metrics(pnls[key][pnls[key].index>='2008-01-01'], deviation=True, r2=True, dev_r2=True))
+    avg_long.append(((pnls[key][pnls[key].index>='2008-01-01']['Signal']+1)/2).mean())
+    # print(calc_analytics(pnls[key][pnls[key].index>='2008-01-01'])['sharpe_blended'])
+    avg_hold.append(calc_avg_hold(pnls[key][pnls[key].index>='2008-01-01']))
+    plot_cum_rtns(pd.DataFrame(pnls[key]['DailyReturn'][pnls[key].index>='2008-01-01']))
+print(np.mean(avg_long))
+print(np.mean(avg_hold))
+
+##################################################### COMBINE #####################################################
+port_tot = FutureAndSpread(port_fut, port_ls)
+port_tot.consolidate_returns()
+print(performance_metrics(port_tot.combined[port_tot.combined.index>='2008-01-01'], deviation=False, r2=True, dev_r2=True))
+# port_tot.plot_against_HFRIMTF(maxLev=5, startdate='2008-01-01')
+# print(performance_metrics(port_tot.combined[port_tot.combined.index<'2008-01-01']))
+# port_tot.plot_against_HFRIMTF(maxLev=5, startdate='2000-01-01', enddate='2007-12-31')
+out = port_tot.compare_HFRIMTF(maxLev=5)
+out.loc['2025-05-31', 'HFRIMTF MonRtn'] = -0.0072
+out.loc['2025-06-30', 'HFRIMTF MonRtn'] = 0.0091
+plot_cum_rtns(out[out.index>='2008-01-01'], dotted_series='HFRIMTF MonRtn')
+
+abc = port_tot.combined[port_tot.combined.index>='2008-01-01']
+consolidate = pd.DataFrame(abc['DailyReturn'])
+print(performance_metrics(consolidate[consolidate.index<'2008-01-01']))
+consolidate.columns = ['Portfolio Rtn 1x']
+for lev in range(2, 6):
+    consolidate[f'Portfolio Rtn {lev}x'] = consolidate['Portfolio Rtn 1x'] * lev
+plot_cum_rtns(consolidate[consolidate.index<'2008-01-01'])
+
+#calculate eigenvalues of the covariance matrix:
+cov = abc[[col for col in abc.columns if col.endswith('_DailyReturn')]].dropna().cov()
+eigval, eigvec = np.linalg.eigh(cov)
+eigval_series = pd.Series(eigval, index=[col for col in cov.columns])
+eigval_scaled = eigval_series / eigval_series.abs().sum()
+abc[[col for col in abc.columns if col.endswith('_unweighed')]].corr()
+
+#evolution time series chart
+out = out[['HFRIMTF MonRtn', 'Portfolio MonRtn 5x']]
+out.columns = ['HFRIMTF', 'Futures Spread Combined 5x']
+out = out.merge(a.rename(columns={'Portfolio MonRtn 5x': 'Old Windows 5x'})['Old Windows 5x'], how='outer', on='Date')
+out = out.merge(b.rename(columns={'Portfolio MonRtn 5x': 'New Windows 5x'})['New Windows 5x'], how='outer', on='Date')
+out = out.merge(c.rename(columns={'Portfolio MonRtn 5x': 'Added Futures 5x'})['Added Futures 5x'], how='outer', on='Date')
+out = out.merge(d.rename(columns={'Portfolio MonRtn 5x': 'Spreads 5x'})['Spreads 5x'], how='outer', on='Date')
+plot_cum_rtns(out[out.index>='2008-01-01'],dotted_series='HFRIMTF', bold_series='Futures Spread Combined 5x')
+
+
+#jusidiction-based
+US = [
+        ('TU', 'CAD', 1.9159, float("nan"), float("nan"), 1.397, 200000, 20, 75), #US 2yr
+        ('FV', 'CAD', 4.4194, float("nan"), float("nan"), 1.397, 100000, 20, 75), #US 5yr
+        ('UXY', 'CAD', 7.8153, float("nan"), float("nan"), 1.397, 100000, 15, 50), #US ultra 10yr
+        ('SFR_offset2', 'CAD', 1, float("nan"), float("nan"), 1.397, 250000, 25, 55) #3m SOFR, rolled into 3rd contract
+    ]
+CA = [
+        ('CV', 'CAD', 1.917, float("nan"), float("nan"), 1.000, 100000, 15, 60), #CA 2yr
+        ('XQ', 'CAD', 4.4424, float("nan"), float("nan"), 1.000, 100000, 15, 50), #CA 5yr
+        ('COR_offset2', 'CAD', 1, float("nan"), float("nan"), 1.000, 250000, 25, 125), #3m CORRA, rolled into 3rd contract
+    ]
+EU = [
+        ('DU', 'CAD', 1.9453, float("nan"), float("nan"), 1.568, 100000, 15, 50), #EU 2yr
+        ('OE', 'CAD', 4.5144, float("nan"), float("nan"), 1.568, 100000, 20, 75), #EU 5yr
+        ('ER_offset2', 'CAD', 1, float("nan"), float("nan"), 1.568, 250000, 10, 100), #3m SONIA, rolled into 3rd contract
+    ]
+UK = [
+        ('BPSWS2 Curncy', 'CAD', 1.918, float("nan"), float("nan"), 1.8592, 100000, 30, 80), #UK 2yr SONIA
+        ('BPSWS5 Curncy', 'CAD', 4.532, float("nan"), float("nan"), 1.8592, 100000, 30, 100), #UK 5yr SONIA
+        ('BPSWS10 Curncy', 'CAD', 8.187, float("nan"), float("nan"), 1.8592, 100000, 30, 105), #UK 10yr SONIA
+        ('SFI_offset2', 'CAD', 1, float("nan"), float("nan"), 1.8592, 250000, 15, 70), #3m SONIA, rolled into 3rd contract   
+    ]
+
+df_all = pd.DataFrame()
+df_all['US'] = PortfolioMomentum(tickerdescs=US, budget=dv01_budget, AmtInvested=AmountInvested, trade_cost=trade_cost, 
+                            data=data, sec_type='futures', relativePnL=relativePnL).consolidate_rtns()['DailyReturn']
+df_all['CA'] = PortfolioMomentum(tickerdescs=CA, budget=dv01_budget, AmtInvested=AmountInvested, trade_cost=trade_cost, 
+                            data=data, sec_type='futures', relativePnL=relativePnL).consolidate_rtns()['DailyReturn']
+df_all['EU'] = PortfolioMomentum(tickerdescs=EU, budget=dv01_budget, AmtInvested=AmountInvested, trade_cost=trade_cost, 
+                            data=data, sec_type='futures', relativePnL=relativePnL).consolidate_rtns()['DailyReturn']
+df_all['UK'] = PortfolioMomentum(tickerdescs=UK, budget=dv01_budget, AmtInvested=AmountInvested, trade_cost=trade_cost, 
+                            data=data, sec_type='futures', relativePnL=relativePnL).consolidate_rtns()['DailyReturn']
+df_all['Spread'] = port_ls.consolidate_rtns()['DailyReturn']
+df_all[df_all.index>='2008-01-01'].corr()
+
+
+
+
+
+
+######################### TEST (Even if we make fast=1 and slow=2, we are not going to get exactly 50% long for each security)
+TEST = [
+        ('TU', 'CAD', 1.9159, float("nan"), float("nan"), 1.397, 200000, 1, 2), #US 2yr
+        ('FV', 'CAD', 4.4194, float("nan"), float("nan"), 1.397, 100000, 1, 2), #US 5yr
+        ('UXY', 'CAD', 7.8153, float("nan"), float("nan"), 1.397, 100000, 1, 2), #US ultra 10yr
+        ('SFR_offset2', 'CAD', 1, float("nan"), float("nan"), 1.397, 250000, 1, 2), #3m SOFR, rolled into 3rd contract
+        ('CV', 'CAD', 1.917, float("nan"), float("nan"), 1.000, 100000, 1, 2), #CA 2yr
+        ('XQ', 'CAD', 4.4424, float("nan"), float("nan"), 1.000, 100000, 1, 2), #CA 5yr
+        ('COR_offset2', 'CAD', 1, float("nan"), float("nan"), 1.000, 250000, 1, 2), #3m CORRA, rolled into 3rd contract
+        ('DU', 'CAD', 1.9453, float("nan"), float("nan"), 1.568, 100000, 1, 2), #EU 2yr
+        ('OE', 'CAD', 4.5144, float("nan"), float("nan"), 1.568, 100000, 1, 2), #EU 5yr
+        ('ER_offset2', 'CAD', 1, float("nan"), float("nan"), 1.568, 250000, 1, 2), #3m SONIA, rolled into 3rd contract
+        ('BPSWS2 Curncy', 'CAD', 1.918, float("nan"), float("nan"), 1.8592, 100000, 1, 2), #UK 2yr SONIA
+        ('BPSWS5 Curncy', 'CAD', 4.532, float("nan"), float("nan"), 1.8592, 100000, 1, 2), #UK 5yr SONIA
+        ('BPSWS10 Curncy', 'CAD', 8.187, float("nan"), float("nan"), 1.8592, 100000, 1, 2), #UK 10yr SONIA
+        ('SFI_offset2', 'CAD', 1, float("nan"), float("nan"), 1.8592, 250000, 1, 2), #3m SONIA, rolled into 3rd contract   
+    ]
+TEST2 = [
+                  ('DU', 'CAD', 1, 1, 1.9453, float("nan"), float("nan"), 1.568, 100000), #long EU 2yr
+                  ('RX', 'CAD', -1, 1, 8.1062, float("nan"), float("nan"), 1.568, 100000), #short EU 10yr
+                  ('BPSWS2 Curncy', 'CAD', 1, 2, 1.918, float("nan"), float("nan"), 1.8592, 100000), #long UK 2yr SONIA
+                  ('BPSWS10 Curncy', 'CAD', -1, 2, 8.187, float("nan"), float("nan"), 1.8592, 100000), #short UK 10yr SONIA
+                  ('DU', 'CAD', 1, 3, 1.9453, float("nan"), float("nan"), 1.568, 100000), #long EU 2yr
+                  ('BPSWS2 Curncy', 'CAD', -1, 3, 1.918, float("nan"), float("nan"), 1.8592, 100000), #short UK 2yr SONIA
+                  ('OE', 'CAD', 1, 4, 4.5144, float("nan"), float("nan"), 1.568, 100000), #long EU 5yr
+                  ('BPSWS5 Curncy', 'CAD', -1, 4, 4.532, float("nan"), float("nan"), 1.8592, 100000), #short UK 5yr SONIA
+                  ('RX', 'CAD', 1, 5, 8.1062, float("nan"), float("nan"), 1.568, 100000), #long EU 10yr
+                  ('BPSWS10 Curncy', 'CAD', -1, 5, 8.187, float("nan"), float("nan"), 1.8592, 100000), #short UK 10yr SONIA
+                  ('SFR_offset2', 'CAD', 1, 6, 1, float("nan"), float("nan"), 1.397, 250000), #long 3m SOFR
+                  ('COR_offset2', 'CAD', -1, 6, 1, float("nan"), float("nan"), 1.000, 250000), #short 3m CORRA
+                  ('SFR_offset2', 'CAD', 1, 7, 1, float("nan"), float("nan"), 1.397, 250000), #long 3m SOFR
+                  ('SFI_offset2', 'CAD', -1, 7, 1, float("nan"), float("nan"), 1.8592, 250000), #short 3m SONIA
+                  ('COR_offset2', 'CAD', 1, 8, 1, float("nan"), float("nan"), 1.000, 250000), #long 3m CORRA
+                  ('SFI_offset2', 'CAD', -1, 8, 1, float("nan"), float("nan"), 1.8592, 250000), #short 3m SONIA
+                  ('ER_offset2', 'CAD', 1, 9, 1, float("nan"), float("nan"), 1.5681, 250000), #long 3m EURIBOR
+                  ('SFI_offset2', 'CAD', -1, 9, 1, float("nan"), float("nan"), 1.8592, 250000), #short 3m SONIA
+                  ('SFR_offset2', 'CAD', 1, 10, 1, float("nan"), float("nan"), 1.397, 250000), #long 3m SOFR
+                  ('ER_offset2', 'CAD', -1, 10, 1, float("nan"), float("nan"), 1.5681, 250000), #short 3m EURIBOR
+                  ('COR_offset2', 'CAD', 1, 11, 1, float("nan"), float("nan"), 1.000, 250000), #long 3m CORRA
+                  ('ER_offset2', 'CAD', -1, 11, 1, float("nan"), float("nan"), 1.5681, 250000), #short 3m EURIBOR
+                  ('CV', 'CAD', 1, 12, 1.917, float("nan"), float("nan"), 1.000, 100000), #long CA 2yr
+                  ('DU', 'EUR', -1, 12, 1.9453, float("nan"), float("nan"), 1.568, 100000), #short EU 2yr
+                  ('FV', 'USD', 1, 13, 4.4194, float("nan"), float("nan"), 1.397, 100000), #long US 5yr
+                  ('OE', 'EUR', -1, 13, 4.5144, float("nan"), float("nan"), 1.568, 100000), #short EU 5yr
+                  ]
+TEST_Window = {
+              1: [1, 2],
+              2: [1, 2],
+              3: [1, 2],
+              4: [1, 2],
+              5: [1, 2],
+              6: [1, 2],
+              7: [1, 2],
+              8: [1, 2],
+              9: [1, 2],
+              10: [1, 2],
+              11: [1, 2],
+              12: [1, 2],
+              13: [1, 2],
+              }
+
+X = PortfolioMomentum(TEST, dv01_budget, AmountInvested, trade_cost, data[data['Date']>='2008-01-01'], 'futures', relativePnL=relativePnL).run_portfolio()
+Y = PortfolioMomentum(tickerdescs=TEST2, budget=dv01_budget, AmtInvested=AmountInvested, trade_cost=trade_cost_LS, 
+                            data=data[data['Date']>='2008-01-01'], sec_type='long_short', ls_windows=TEST_Window, relativePnL=relativePnL).run_portfolio()
+
+for name in X.keys():
+    print(name)
+    print(performance_metrics(X[name], deviation=True))
+for name in Y.keys():
+    print(name)
+    print(performance_metrics(Y[name], deviation=True))
