@@ -1,0 +1,655 @@
+import os
+from support_codes.model_selection import *
+from support_codes.consolidate_portfolio import *
+
+
+##################################################### SETTINGS #####################################################
+# Backtest Settings
+AmountInvested = 100000000 # Target notional in CAD
+dv01_budget = 27000 # In CAD
+trade_cost = 0.20 # In bps
+trade_cost_LS = 0.15 # In bps
+fix_fx = True # Toggle to keep FX rates fixed
+
+# Cross Over Scenarios Engine Settings
+Engine = CrossOverScenarios(fast_start=5, slow_start=20, max_fast=50, max_slow=200, skip=10, momentum_2nd=True, ignore_1st_order=False,
+                            slowslope_start=5, fastslope_start=10, max_slopefast=50, max_slopeslow=150, skip_slope=10, 
+                            buffer_start=0.0, max_buffer=0.0, skip_buffer=0.1, deviation=True, r2=True, dev_r2=True,
+                            dynamic_alloc=True)
+relativePnL = True # Toggle to generate returns in % or in $Amt
+decay = False # Toggle to exponentially decay longer history to give more weight to recent data
+decayrate = 0.01 # Exponential decay rate if previous toggle is True
+
+# Data Source and Filepath Settings
+bbg_data = False #Toggle to pull from BBG API or pull data from Excel files
+path = os.getcwd()
+data_path = os.path.join(path, 'Data', 'futures data.xlsx') # Local file
+fx_path = os.path.join(path, 'Data', 'DM FX data.xlsx') # Local file
+rates_path = os.path.join(path, 'Data', 'DM rates history.xlsx') # Local file
+
+# Plotting Settings
+plot = False # Toggle to plot 5 heatmaps for each security or pair 
+savefig = False # Toggle to save heatmaps in "fig_path"
+fig_path = os.path.join(path, 'Figures') # File path to save heatmaps
+
+# Model Selection Settings
+criteria_fut = 'sharpe_dev' # Window selection criteria for futures
+criteria_LS = 'sharpe' # Window selection criteria for pairs
+cluster = False # Toggle to use clustering to select windows
+cluster_n = 9 # Cluster matrix size
+run_CV = True # Toggle to run cross-validation based on parameters below 
+test_weight = 0.5 # Leave-out sample sharpe has x% weight
+shares = 4 # Number of shares to slice total data. Training% = (shares-1)/shares; Testing% = 1/shares
+glue_train = False # Toggle to glue training sample
+
+# Pandas Settings
+pd.set_option('mode.chained_assignment', None) # Disable pandas warning for not modifying original dataframe
+pd.set_option('expand_frame_repr', False) # Print dataframes in a single line if it fits
+pd.set_option('display.max_columns', 15) # Truncate middle columns if len(df.columns) > 15
+
+
+##################################################### LOADING DATA #####################################################
+############################################## IGNORE IF PULLING FROM BBG ##############################################
+if bbg_data:
+    from support_codes.bbg import *
+    ### Adapt to pull from BBG
+
+else:
+    sheet_names = pd.ExcelFile(data_path).sheet_names
+    data = pd.DataFrame(columns=['Date'])
+    for sheet in sheet_names[1:]:
+        df = pd.read_excel(data_path, sheet_name=sheet, engine='openpyxl')
+        if sheet.endswith(" Curncy"):
+            df = df[['Date', 'PX_LAST', 'PX_BID', 'PX_ASK']]
+            df.columns = ['Date', f'{sheet}_mid', f'{sheet}_bid', f'{sheet}_ask']
+        else:
+            df = df[['Date', 'PX_LAST', 'PX_BID', 'PX_ASK', 'FUT_EQV_DUR_NOTL']]
+            df.columns = ['Date', f'{sheet}_mid', f'{sheet}_bid', f'{sheet}_ask', f'{sheet}_Dur']
+        df['Date'] = pd.to_datetime(df['Date'])
+        data = pd.merge(data, df, on='Date', how='outer')
+
+    sheet_names = pd.ExcelFile(fx_path).sheet_names
+    for sheet in sheet_names:
+        df = pd.read_excel(fx_path, sheet_name=sheet, engine='openpyxl')
+        df.columns = ['Date', f'{sheet}']
+        df['Date'] = pd.to_datetime(df['Date'])
+        data = pd.merge(data, df, on='Date', how='outer')
+
+    data_oos = data[data['Date'] <= '2008-01-01']
+    data = data[data['Date'] >= '2007-01-01']
+    data[['SFR_Dur','SFR_offset1_Dur','SFR_offset2_Dur','SFR_offset3_Dur','SER_Dur','SER_offset1_Dur','SER_offset2_Dur',
+          'SER_offset3_Dur','COR_Dur','COR_offset1_Dur','COR_offset2_Dur','COR_offset3_Dur','OOR_Dur','SFI_Dur','SFI_offset1_Dur',
+          'SFI_offset2_Dur','SFI_offset3_Dur','ER_Dur','ER_offset1_Dur','ER_offset2_Dur','ER_offset3_Dur']] = 1
+    # Force overnight duration to 1 for compatibility with functions
+
+
+##################################################### Determine Windows #####################################################
+######################################################### | | | | | #########################################################
+######################################################## \/\/\/\/\/ #########################################################
+
+##################################################### FUTURES MOMENTUM #####################################################
+#ticker, ccy, CurrentDuration, Weight, MV/Contract, FXRate, ContractSizeLocal, fast_window, slow_window, fast_slope, slow_slope, buffer
+TickerDescs = [
+               ('TU', 'CAD', 1.9159, float("nan"), float("nan"), 1.397, 200000, 25, 50, 30, 145, 0.0), #US 2yr
+               ('FV', 'CAD', 4.4194, float("nan"), float("nan"), 1.397, 100000, 25, 50, 30, 145, 0.0), #US 5yr
+            #    ('TY', 'CAD', 7.7915, float("nan"), float("nan"), 1.397, 100000, 25, 195, 20, 115, -1), #US 10yr
+               ('UXY', 'CAD', 7.8153, float("nan"), float("nan"), 1.397, 100000, 15, 50, 30, 35, 0.0), #US ultra 10yr
+               ('CV', 'CAD', 1.917, float("nan"), float("nan"), 1.000, 100000, 25, 50, 10, 115, 0.0), #CA 2yr
+               ('XQ', 'CAD', 4.4424, float("nan"), float("nan"), 1.000, 100000, 15, 50, 20, 45, 0.0), #CA 5yr
+               ('CN', 'CAD', 7.9259, float("nan"), float("nan"), 1.000, 100000, 15, 60, 20, 35, 0.0), #CA 10yr
+               ('DU', 'CAD', 1.9453, float("nan"), float("nan"), 1.568, 100000, 25, 70, 30, 45, 0.0), #EU 2yr
+               ('OE', 'CAD', 4.5144, float("nan"), float("nan"), 1.568, 100000, 45, 160, 50, 85, 0.0), #EU 5yr
+               ('BPSWS2 Curncy', 'CAD', 1.918, float("nan"), float("nan"), 1.8592, 100000, 35, 90, 50, 145, 0.0), #UK 2yr SONIA (ContractSize is a dummy for compatibility)
+               ('BPSWS5 Curncy', 'CAD', 4.532, float("nan"), float("nan"), 1.8592, 100000, 35, 100, 10, 25, 0.0), #UK 5yr SONIA (ContractSize is a dummy for compatibility)
+               ('BPSWS10 Curncy', 'CAD', 8.187, float("nan"), float("nan"), 1.8592, 100000, 15, 200, 50, 145, 0.0), #UK 10yr SONIA (ContractSize is a dummy for compatibility)
+               ('SFR_offset2', 'CAD', 1, float("nan"), float("nan"), 1.397, 250000, 25, 50, 40, 125, 0.0), #3m SOFR, rolled into 3rd contract
+               ('COR_offset2', 'CAD', 1, float("nan"), float("nan"), 1.000, 250000, 35, 130, 10, 135, 0.0), #3m CORRA, rolled into 3rd contract
+               ('SFI_offset2', 'CAD', 1, float("nan"), float("nan"), 1.8592, 250000, 5, 20, 10, 145, 0.0), #3m SONIA, rolled into 3rd contract
+               ('ER_offset2', 'CAD', 1, float("nan"), float("nan"), 1.5681, 250000, 5, 100, 20, 25, 0.0), #3m EURIBOR, rolled into 3rd contract
+               ]
+Descs_adj = TransformTickerDescs(TickerDescs, dv01_budget, AmountInvested)
+tickers_list = Descs_adj.tickers()
+Tickerdescs = Descs_adj.futures()
+
+## In-sample best parameters (output stored as json and csv)
+store_params = pd.DataFrame(index=tickers_list)
+pnls = {}
+for ticker, currency, notional, weight, contracts, dv01, *_, fast, slow, in Tickerdescs:
+    print(f'Processing {ticker}')
+    if fix_fx:
+        currency = 'CAD'
+    scenarios = Engine.futures_simplified(ticker, currency, notional, contracts, dv01, trade_cost, data, RelativePnL=relativePnL, decay=decay, decayrate=decayrate)
+    pnls[ticker] = scenarios
+    idx = scenarios[criteria_fut].idxmax()
+    if store_params.empty:
+        store_params = pd.DataFrame(columns=scenarios.columns, index=tickers_list)
+    store_params.loc[ticker, :] = scenarios.loc[idx]
+
+## Generating lower dimension views 
+view = 'sharpe'
+for ticker in tickers_list:
+    print(ticker)
+    wind_view = pnls[ticker].pivot_table(index='slow_window', columns='fast_window', values=view)
+    plot_3d_surface(wind_view, f'{ticker} {view} window view', xlabel='Fast', ylabel='Slow')
+    # plot_heatmap(wind_view)
+    slope_view = pnls[ticker].pivot_table(index='slow_slope', columns='fast_slope', values=view)
+    plot_3d_surface(slope_view, f'{ticker} {view} slope view', xlabel='Fast', ylabel='Slow')
+    # plot_heatmap(slope_view)
+    buffer_view = pnls[ticker].pivot_table(index='buffer', values=view)
+    print(buffer_view)
+
+## Plotting individuals with optimized (very overfitted but just for visualization) parameters
+results = {}
+for i, ticker in enumerate(store_params.index):
+    result = cross_over_strategy(Tickerdescs[i][0], Tickerdescs[i][1], Tickerdescs[i][2], Tickerdescs[i][4], Tickerdescs[i][5], 
+                                 trade_cost, store_params.loc[ticker,'fast_window'], store_params.loc[ticker,'slow_window'], data, 
+                                 momentum_2nd=True, fast_slope=store_params.loc[ticker,'fast_slope'],slow_slope=store_params.loc[ticker,'slow_slope'],
+                                 buffer_2nd=store_params.loc[ticker,'buffer'],RelativePnL=relativePnL, ignore_1st_order=False, dynamic_alloc=True)
+    results[ticker] = result
+    print(f'{ticker} Best Possible Results:')
+    print(performance_metrics(result, deviation=True, r2=True, dev_r2=True))
+    plot_cum_rtns(pd.DataFrame(result['DailyReturn']))
+
+## Best performance achievable (in-sample optimization w/ in-sample test):
+fut_best = PortfolioMomentum(TickerDescs, dv01_budget, AmountInvested, trade_cost, data, 'futures', relativePnL=relativePnL, 
+                             momentum_2nd_order=True, ignore_1st_order=False, dynamic_alloc=True)
+print(performance_metrics(fut_best.consolidate_rtns(), r2=True))
+fut_best.plot_against_HFRIMTF(maxLev=5, startdate='2008-01-01')
+
+## Reducing overfit with cross-validation
+if run_CV:
+    cv_futures = {}
+    for ticker, currency, notional, weight, contracts, dv01, *_, in Tickerdescs:
+        if fix_fx:
+            currency = 'CAD'
+        print(f'Processing {ticker}')
+        df = data[pd.notnull(data[f'{ticker}_mid'])]
+        cv_futures[ticker] = {}
+        cv = CrossValidation(Engine, test_weight, df, shares, criteria_fut, cluster=False, cluster_size=cluster_n, glue=glue_train)
+        cv_futures[ticker]['windows'], cv_futures[ticker]['avgs'] = cv.best_windows(ticker, currency, notional, contracts, dv01, 
+                                                                                    trade_cost, RelativePnL=relativePnL, decay=decay, 
+                                                                                    decayrate=decayrate)
+        print(cv_futures[ticker]['windows'])
+for key in cv_futures.keys():
+    print(cv_futures[key]['windows'])
+# port = PortfolioMomentum(TickerDescs, dv01_budget, AmountInvested, trade_cost, data, 'futures', relativePnL=relativePnL).run_portfolio()
+# for tick in port.keys():
+#     print(tick)
+#     print(performance_metrics(port[tick]))
+#     plot_cum_rtns(pd.DataFrame(port[tick]['DailyReturn']))
+
+
+##################################################### 2-10 SPREAD MOMENTUM #####################################################
+#ticker, ccy, CurrentDuration, Direction, Pair#, Weight, MV/Contract, FXRate, ContractSizeLocal, fast_window, slow_window
+LongShortDescs = [('TU', 'USD', 1, 1, 1.9159, float("nan"), float("nan"), 1.397, 200000), #long US 2yr
+                  ('TY', 'USD', -1, 1, 7.7915, float("nan"), float("nan"), 1.397, 100000), #short US 10yr
+                  ('CV', 'CAD', 1, 2, 1.917, float("nan"), float("nan"), 1.000, 100000), #long CA 2yr
+                  ('CN', 'CAD', -1, 2, 7.9259, float("nan"), float("nan"), 1.000, 100000), #short CA 10yr
+                  ('DU', 'EUR', 1, 3, 1.9453, float("nan"), float("nan"), 1.568, 100000), #long EU 2yr
+                  ('RX', 'EUR', -1, 3, 8.1062, float("nan"), float("nan"), 1.568, 100000), #short EU 10yr
+                  ('BPSWS2 Curncy', 'GBP', 1, 4, 1.918, float("nan"), float("nan"), 1.8592, 100000), #long UK 2yr SONIA (ContractSize is a dummy for compatibility)
+                  ('BPSWS10 Curncy', 'GBP', -1, 4, 8.187, float("nan"), float("nan"), 1.8592, 100000), #short UK 10yr SONIA (ContractSize is a dummy for compatibility)
+                  ]
+LongShortDescs_adj = TransformTickerDescs(LongShortDescs, dv01_budget, AmountInvested)
+tickers_list = LongShortDescs_adj.tickers()
+LongShortDict = LongShortDescs_adj.unpack_long_short()
+
+## In-sample best parameters (output stored as json and csv)
+store_params_LS = pd.DataFrame(index=tickers_list)
+pnls_LS = {}
+for pair in LongShortDict.keys():
+    tickers = LongShortDict[pair]['tickers']
+    currencies = LongShortDict[pair]['currencies']
+    if fix_fx:
+        currencies = ['CAD','CAD']
+    directions = LongShortDict[pair]['directions']
+    notionals = LongShortDict[pair]['notionals']
+    contracts = LongShortDict[pair]['contracts']
+    dv01s = LongShortDict[pair]['dv01s']
+    name = '_'.join(tickers)+'_spread'
+    scenarios = Engine.long_short_simplified(tickers, currencies, directions, notionals, contracts, dv01s, trade_cost_LS,
+                                               data, RelativePnL=relativePnL, decay=decay, decayrate=decayrate)
+    pnls_LS[name] = scenarios
+    idx = scenarios[criteria_LS].idxmax()
+    if store_params_LS.empty:
+        store_params_LS = pd.DataFrame(columns=scenarios.columns)
+    store_params_LS.loc[name, :] = scenarios.loc[idx]
+# store_json(pnls_LS, '2-10 in_sample.json')
+
+## Generating lower dimension views 
+view = 'sharpe'
+for key in pnls_LS.keys():
+    print(key)
+    wind_view = pnls_LS[key].pivot_table(index='slow_window', columns='fast_window', values=view)
+    plot_3d_surface(wind_view, f'{key} {view} window view', xlabel='Fast', ylabel='Slow')
+    # plot_heatmap(wind_view)
+    slope_view = pnls_LS[key].pivot_table(index='slow_slope', columns='fast_slope', values=view)
+    plot_3d_surface(slope_view, f'{key} {view} slope view', xlabel='Fast', ylabel='Slow')
+    # plot_heatmap(slope_view)
+    buffer_view = pnls_LS[key].pivot_table(index='buffer', values=view)
+    print(buffer_view)
+
+## Reducing overfit with cross-validation
+if run_CV:
+    cv_LS = {}
+    for pair in LongShortDict.keys():
+        tickers = LongShortDict[pair]['tickers']
+        currencies = LongShortDict[pair]['currencies']
+        if fix_fx:
+            currencies = ['CAD','CAD']
+        directions = LongShortDict[pair]['directions']
+        notionals = LongShortDict[pair]['notionals']
+        contracts = LongShortDict[pair]['contracts']
+        dv01s = LongShortDict[pair]['dv01s']
+        name = '_'.join(tickers)+'_spread'
+        print(f'Processing {name}')
+        df = data[pd.notnull(data[f'{tickers[0]}_mid']) & pd.notnull(data[f'{tickers[1]}_mid'])]
+        cv_LS[name] = {}
+        cv = CrossValidation(Engine, test_weight, df, shares, criteria=criteria_LS, cluster=cluster, cluster_size=cluster_n, glue=glue_train)
+        cv_LS[name]['windows'], cv_LS[name]['avgs'] = cv.best_windows_LS(tickers, currencies, directions, notionals, contracts, dv01s, trade_cost_LS, 
+                                                                         RelativePnL=relativePnL, decay=decay, decayrate=decayrate)
+        print(cv_LS[name]['windows'])
+
+windows = {
+              1: [15, 40],
+              2: [15, 50],
+              3: [25, 80],
+              4: [20, 60],
+              }
+
+port_ls = PortfolioMomentum(tickerdescs=LongShortDescs, budget=dv01_budget, AmtInvested=AmountInvested, trade_cost=trade_cost_LS, 
+                            data=data, sec_type='long_short', ls_windows=windows, relativePnL=relativePnL, decay=False, 
+                            decayrate=0.005, conditional_decay=True, condition=[100,300]).run_portfolio()
+
+for name in port_ls.keys():
+    print(name)
+    print(performance_metrics(port_ls[name]))
+    plot_cum_rtns(pd.DataFrame(port_ls[name]['DailyReturn']))
+
+
+##################################################### CROSS-CURRENCY 2YR SPREAD MOMENTUM #####################################################
+#ticker, ccy, CurrentDuration, Direction, Pair#, Weight, MV/Contract, FXRate, ContractSizeLocal, fast_window, slow_window
+CrossCurDescs2 = [('TU', 'USD', 1, 1, 1.9159, float("nan"), float("nan"), 1.397, 200000, 10, 50), #long US 2yr
+                ('CV', 'CAD', -1, 1, 1.917, float("nan"), float("nan"), 1.000, 100000, 10, 50), #short CA 2yr
+                ('TU', 'USD', 1, 2, 1.9159, float("nan"), float("nan"), 1.397, 200000, 10, 50), #long US 2yr
+                ('DU', 'EUR', -1, 2, 1.9453, float("nan"), float("nan"), 1.568, 100000, 10, 50), #short EU 2yr
+                ('TU', 'USD', 1, 3, 1.9159, float("nan"), float("nan"), 1.397, 200000, 10, 50), #long US 2yr
+                ('BPSWS2 Curncy', 'GBP', -1, 3, 1.918, float("nan"), float("nan"), 1.8592, 100000, 20, 110), #short UK 2yr SONIA
+                ('CV', 'CAD', 1, 4, 1.917, float("nan"), float("nan"), 1.000, 100000, 10, 50), #long CA 2yr
+                ('DU', 'EUR', -1, 4, 1.9453, float("nan"), float("nan"), 1.568, 100000, 10, 50), #short EU 2yr
+                ('CV', 'CAD', 1, 5, 1.917, float("nan"), float("nan"), 1.000, 100000, 10, 50), #long CA 2yr
+                ('BPSWS2 Curncy', 'GBP', -1, 5, 1.918, float("nan"), float("nan"), 1.8592, 100000, 20, 110), #short UK 2yr SONIA
+                ('DU', 'EUR', 1, 6, 1.9453, float("nan"), float("nan"), 1.568, 100000, 10, 50), #long EU 2yr
+                ('BPSWS2 Curncy', 'GBP', -1, 6, 1.918, float("nan"), float("nan"), 1.8592, 100000, 20, 110), #short UK 2yr SONIA
+                ]
+CrossCurDescs2_adj = TransformTickerDescs(CrossCurDescs2, dv01_budget, AmountInvested)
+tickers_list = CrossCurDescs2_adj.tickers()
+CrossCurDict2 = CrossCurDescs2_adj.unpack_long_short()
+
+## In-sample best parameters (output stored as json and csv)
+store_params_cc2 = pd.DataFrame(index=tickers_list)
+pnls_cc2 = {}
+for pair in CrossCurDict2.keys():
+    tickers = CrossCurDict2[pair]['tickers']
+    currencies = CrossCurDict2[pair]['currencies']
+    if fix_fx:
+        currencies = ['CAD','CAD']
+    directions = CrossCurDict2[pair]['directions']
+    notionals = CrossCurDict2[pair]['notionals']
+    contracts = CrossCurDict2[pair]['contracts']
+    dv01s = CrossCurDict2[pair]['dv01s']
+    name = '_'.join(tickers)+'_spread'
+    print(f'Processing {name}')
+    scenarios = Engine.long_short_simplified(tickers, currencies, directions, notionals, contracts, dv01s, trade_cost_LS,
+                                               data, RelativePnL=relativePnL, decay=decay, decayrate=decayrate)
+    pnls_cc2[name] = scenarios
+    idx = scenarios[criteria_LS].idxmax()
+    if store_params_cc2.empty:
+        store_params_cc2 = pd.DataFrame(columns=scenarios.columns)
+    store_params_cc2.loc[name, :] = scenarios.loc[idx]
+# store_json(pnls_cc2, 'cross currency 2yr in_sample.json')
+
+## Reducing overfit with cross-validation
+if run_CV:
+    cv_cc2 = {}
+    for pair in CrossCurDict2.keys():
+        tickers = CrossCurDict2[pair]['tickers']
+        currencies = CrossCurDict2[pair]['currencies']
+        if fix_fx:
+            currencies = ['CAD','CAD']
+        directions = CrossCurDict2[pair]['directions']
+        notionals = CrossCurDict2[pair]['notionals']
+        contracts = CrossCurDict2[pair]['contracts']
+        dv01s = CrossCurDict2[pair]['dv01s']
+        name = '_'.join(tickers)+'_spread'
+        print(f'Processing {name}')
+        df = data[pd.notnull(data[f'{tickers[0]}_mid']) & pd.notnull(data[f'{tickers[1]}_mid'])]
+        cv_cc2[name] = {}
+        cv = CrossValidation(Engine, test_weight, df, shares, criteria=criteria_LS, cluster=cluster, cluster_size=cluster_n, glue=glue_train)
+        cv_cc2[name]['windows'], cv_cc2[name]['avgs'] = cv.best_windows_LS(tickers, currencies, directions, notionals, contracts, dv01s, 
+                                                                           trade_cost_LS, RelativePnL=relativePnL, decay=decay, decayrate=decayrate)
+        print(cv_cc2[name]['windows'])
+
+windows = {
+              1: [15, 45],
+              2: [45, 150],
+              3: [15, 80],
+              4: [30, 85],
+              5: [15, 60],
+              6: [15, 85],
+              }
+
+port_cc2 = PortfolioMomentum(tickerdescs=CrossCurDescs2, budget=dv01_budget, AmtInvested=AmountInvested, trade_cost=trade_cost_LS, 
+                            data=data, sec_type='long_short', ls_windows=windows, relativePnL=relativePnL, decay=False, 
+                            decayrate=0.005, conditional_decay=True, condition=[100,300]).run_portfolio()
+
+for name in port_cc2.keys():
+    print(name)
+    print(performance_metrics(port_cc2[name]))
+    plot_cum_rtns(pd.DataFrame(port_cc2[name]['DailyReturn']))
+
+
+##################################################### CROSS-CURRENCY 5YR SPREAD MOMENTUM #####################################################
+#ticker, ccy, CurrentDuration, Direction, Pair#, Weight, MV/Contract, FXRate, ContractSizeLocal, fast_window, slow_window
+CrossCurDescs5 = [('FV', 'USD', 1, 1, 4.4194, float("nan"), float("nan"), 1.397, 100000, 10, 50), #long US 5yr
+                ('XQ', 'CAD', -1, 1, 4.4424, float("nan"), float("nan"), 1.000, 100000, 10, 60), #short CA 5yr
+                ('FV', 'USD', 1, 2, 4.4194, float("nan"), float("nan"), 1.397, 100000, 10, 50), #long US 5yr
+                ('OE', 'EUR', -1, 2, 4.5144, float("nan"), float("nan"), 1.568, 100000, 10, 120), #short EU 5yr
+                ('FV', 'USD', 1, 3, 4.4194, float("nan"), float("nan"), 1.397, 100000, 10, 50), #long US 5yr
+                ('BPSWS5 Curncy', 'GBP', -1, 3, 4.532, float("nan"), float("nan"), 1.8592, 100000, 20, 110), #short UK 5yr SONIA
+                ('XQ', 'CAD', 1, 4, 4.4424, float("nan"), float("nan"), 1.000, 100000, 10, 60), #long CA 5yr
+                ('OE', 'EUR', -1, 4, 4.5144, float("nan"), float("nan"), 1.568, 100000, 10, 120), #short EU 5yr
+                ('XQ', 'CAD', 1, 5, 4.4424, float("nan"), float("nan"), 1.000, 100000, 10, 60), #long CA 5yr
+                ('BPSWS5 Curncy', 'GBP', -1, 5, 4.532, float("nan"), float("nan"), 1.8592, 100000, 20, 110), #short UK 5yr SONIA
+                ('OE', 'EUR', 1, 6, 4.5144, float("nan"), float("nan"), 1.568, 100000, 10, 120), #long EU 5yr
+                ('BPSWS5 Curncy', 'GBP', -1, 6, 4.532, float("nan"), float("nan"), 1.8592, 100000, 20, 110), #short UK 5yr SONIA
+                ]
+CrossCurDescs5_adj = TransformTickerDescs(CrossCurDescs5, dv01_budget, AmountInvested)
+CrossCurDict5 = CrossCurDescs5_adj.unpack_long_short()
+
+## In-sample best parameters (output stored as json and csv)
+store_params_cc5 = pd.DataFrame(index=tickers_list)
+pnls_cc5 = {}
+for pair in CrossCurDict5.keys():
+    tickers = CrossCurDict5[pair]['tickers']
+    currencies = CrossCurDict5[pair]['currencies']
+    if fix_fx:
+        currencies = ['CAD','CAD']
+    directions = CrossCurDict5[pair]['directions']
+    notionals = CrossCurDict5[pair]['notionals']
+    contracts = CrossCurDict5[pair]['contracts']
+    dv01s = CrossCurDict5[pair]['dv01s']
+    name = '_'.join(tickers)+'_spread'
+    print(f'Processing {name}')
+    scenarios = Engine.long_short_simplified(tickers, currencies, directions, notionals, contracts, dv01s, trade_cost_LS,
+                                               data, RelativePnL=relativePnL, decay=decay, decayrate=decayrate)
+    pnls_cc5[name] = scenarios
+    idx = scenarios[criteria_LS].idxmax()
+    if store_params_cc5.empty:
+        store_params_cc5 = pd.DataFrame(columns=scenarios.columns)
+    store_params_cc5.loc[name, :] = scenarios.loc[idx]
+# store_json(pnls_cc5, 'cross currency 5yr in_sample.json')
+
+## Reducing overfit with cross-validation
+if run_CV:
+    cv_cc5 = {}
+    for pair in CrossCurDict5.keys():
+        tickers = CrossCurDict5[pair]['tickers']
+        currencies = CrossCurDict5[pair]['currencies']
+        if fix_fx:
+            currencies = ['CAD','CAD']
+        directions = CrossCurDict5[pair]['directions']
+        notionals = CrossCurDict5[pair]['notionals']
+        contracts = CrossCurDict5[pair]['contracts']
+        dv01s = CrossCurDict5[pair]['dv01s']
+        name = '_'.join(tickers)+'_spread'
+        print(f'Processing {name}')
+        df = data[pd.notnull(data[f'{tickers[0]}_mid']) & pd.notnull(data[f'{tickers[1]}_mid'])]
+        cv_cc5[name] = {}
+        cv = CrossValidation(Engine, test_weight, df, shares, criteria=criteria_LS, cluster=cluster, cluster_size=cluster_n, glue=glue_train)
+        cv_cc5[name]['windows'], cv_cc5[name]['avgs'] = cv.best_windows_LS(tickers, currencies, directions, notionals, contracts, dv01s, 
+                                                                           trade_cost_LS, RelativePnL=relativePnL, decay=decay, decayrate=decayrate)
+        print(cv_cc5[name]['windows'])
+
+windows = {
+              1: [15, 40],
+              2: [65, 150],
+              3: [15, 100],
+              4: [30, 100],
+              5: [30, 150],
+              6: [35, 90],
+              }
+
+port_cc5 = PortfolioMomentum(tickerdescs=CrossCurDescs5, budget=dv01_budget, AmtInvested=AmountInvested, trade_cost=trade_cost_LS, 
+                            data=data, sec_type='long_short', ls_windows=windows, relativePnL=relativePnL, decay=False, 
+                            decayrate=0.005, conditional_decay=True, condition=[100,300]).run_portfolio()
+
+for name in port_cc5.keys():
+    print(name)
+    print(performance_metrics(port_cc5[name]))
+    plot_cum_rtns(pd.DataFrame(port_cc5[name]['DailyReturn']))
+
+
+##################################################### CROSS-CURRENCY 10YR SPREAD MOMENTUM #####################################################
+#ticker, ccy, CurrentDuration, Direction, Pair#, Weight, MV/Contract, FXRate, ContractSizeLocal, fast_window, slow_window
+CrossCurDescs10 = [('TY', 'USD', 1, 1, 7.7915, float("nan"), float("nan"), 1.397, 100000, 10, 50), #long US 10yr
+                ('CN', 'CAD', -1, 1, 7.9259, float("nan"), float("nan"), 1.000, 100000, 10, 60), #short CA 10yr
+                ('TY', 'USD', 1, 2, 7.7915, float("nan"), float("nan"), 1.397, 100000, 10, 50), #long US 10yr
+                ('RX', 'EUR', -1, 2, 8.1062, float("nan"), float("nan"), 1.568, 100000, 10, 120), #short EU 10yr
+                ('TY', 'USD', 1, 3, 7.7915, float("nan"), float("nan"), 1.397, 100000, 10, 50), #long US 10yr
+                ('BPSWS10 Curncy', 'GBP', -1, 3, 8.187, float("nan"), float("nan"), 1.8592, 100000, 20, 110), #short UK 10yr SONIA
+                ('CN', 'CAD', 1, 4, 7.9259, float("nan"), float("nan"), 1.000, 100000, 10, 60), #long CA 10yr
+                ('RX', 'EUR', -1, 4, 8.1062, float("nan"), float("nan"), 1.568, 100000, 10, 120), #short EU 10yr
+                ('CN', 'CAD', 1, 5, 7.9259, float("nan"), float("nan"), 1.000, 100000, 10, 60), #long CA 10yr
+                ('BPSWS10 Curncy', 'GBP', -1, 5, 8.187, float("nan"), float("nan"), 1.8592, 100000, 20, 110), #short UK 10yr SONIA
+                ('RX', 'EUR', 1, 6, 8.1062, float("nan"), float("nan"), 1.568, 100000, 10, 120), #long EU 10yr
+                ('BPSWS10 Curncy', 'GBP', -1, 6, 8.187, float("nan"), float("nan"), 1.8592, 100000, 20, 110), #short UK 10yr SONIA
+                ]
+CrossCurDescs10_adj = TransformTickerDescs(CrossCurDescs10, dv01_budget, AmountInvested)
+CrossCurDict10 = CrossCurDescs10_adj.unpack_long_short()
+
+## In-sample best parameters (output stored as json and csv)
+store_params_cc10 = pd.DataFrame(index=tickers_list)
+pnls_cc10 = {}
+for pair in CrossCurDict10.keys():
+    tickers = CrossCurDict10[pair]['tickers']
+    currencies = CrossCurDict10[pair]['currencies']
+    if fix_fx:
+        currencies = ['CAD','CAD']
+    directions = CrossCurDict10[pair]['directions']
+    notionals = CrossCurDict10[pair]['notionals']
+    contracts = CrossCurDict10[pair]['contracts']
+    dv01s = CrossCurDict10[pair]['dv01s']
+    name = '_'.join(tickers)+'_spread'
+    print(f'Processing {name}')
+    scenarios = Engine.long_short_simplified(tickers, currencies, directions, notionals, contracts, dv01s, trade_cost_LS,
+                                               data, RelativePnL=relativePnL, decay=decay, decayrate=decayrate)
+    pnls_cc10[name] = scenarios
+    idx = scenarios[criteria_LS].idxmax()
+    if store_params_cc10.empty:
+        store_params_cc10 = pd.DataFrame(columns=scenarios.columns)
+    store_params_cc10.loc[name, :] = scenarios.loc[idx]
+store_json(pnls_cc10, 'cross currency 10yr in_sample.json')
+
+## Reducing overfit with cross-validation
+if run_CV:
+    cv_cc10 = {}
+    for pair in CrossCurDict10.keys():
+        tickers = CrossCurDict10[pair]['tickers']
+        currencies = CrossCurDict10[pair]['currencies']
+        if fix_fx:
+            currencies = ['CAD','CAD']
+        directions = CrossCurDict10[pair]['directions']
+        notionals = CrossCurDict10[pair]['notionals']
+        contracts = CrossCurDict10[pair]['contracts']
+        dv01s = CrossCurDict10[pair]['dv01s']
+        name = '_'.join(tickers)+'_spread'
+        print(f'Processing {name}')
+        df = data[pd.notnull(data[f'{tickers[0]}_mid']) & pd.notnull(data[f'{tickers[1]}_mid'])]
+        cv_cc10[name] = {}
+        cv = CrossValidation(Engine, test_weight, df, shares, criteria_LS, cluster=cluster, cluster_size=5, glue=False)
+        cv_cc10[name]['windows'], cv_cc10[name]['avgs'] = cv.best_windows_LS(tickers, currencies, directions, notionals, contracts, dv01s, 
+                                                                             trade_cost_LS, RelativePnL=relativePnL, decay=decay, decayrate=decayrate)
+        print(cv_cc10[name]['windows'])
+
+windows = {
+              1: [15, 55],
+              2: [15, 135],
+              3: [15, 45],
+              4: [10, 25],
+              5: [15, 50],
+              6: [15, 80],
+              }
+
+port_cc10 = PortfolioMomentum(tickerdescs=CrossCurDescs10, budget=dv01_budget, AmtInvested=AmountInvested, trade_cost=trade_cost_LS, 
+                            data=data, sec_type='long_short', ls_windows=windows, relativePnL=relativePnL, decay=False, 
+                            decayrate=0.005, conditional_decay=True, condition=[100,300]).run_portfolio()
+
+for name in port_cc10.keys():
+    print(name)
+    print(performance_metrics(port_cc10[name]))
+    plot_cum_rtns(pd.DataFrame(port_cc10[name]['DailyReturn']))
+
+
+##################################################### CROSS-CURRENCY OVERNIGHT SPREAD MOMENTUM #####################################################
+#ticker, ccy, CurrentDuration, Direction, Pair#, Weight, MV/Contract, FXRate, ContractSizeLocal, fast_window, slow_window
+OvernightDescs = [#('SFR', 'USD', 1, 1, 1, float("nan"), float("nan"), 1.397, 250000, 10, 50), #long 3m SOFR
+                  #('COR', 'CAD', -1, 1, 1, float("nan"), float("nan"), 1.000, 250000, 10, 60), #short 3m CORRA
+                  #('SFR_offset1', 'USD', 1, 2, 1, float("nan"), float("nan"), 1.397, 250000, 10, 50), #long 3m SOFR
+                  #('COR_offset1', 'CAD', -1, 2, 1, float("nan"), float("nan"), 1.000, 250000, 10, 60), #short 3m CORRA
+                  ('SFR_offset2', 'USD', 1, 3, 1, float("nan"), float("nan"), 1.397, 250000, 10, 50), #long 3m SOFR
+                  ('COR_offset2', 'CAD', -1, 3, 1, float("nan"), float("nan"), 1.000, 250000, 10, 60), #short 3m CORRA
+                  #('SFR_offset3', 'USD', 1, 4, 1, float("nan"), float("nan"), 1.397, 250000, 10, 50), #long 3m SOFR
+                  #('COR_offset3', 'CAD', -1, 4, 1, float("nan"), float("nan"), 1.000, 250000, 10, 60), #short 3m CORRA
+                  ('SFR_offset2', 'USD', 1, 5, 1, float("nan"), float("nan"), 1.397, 250000), #long 3m SOFR
+                  ('SFI_offset2', 'GBP', -1, 5, 1, float("nan"), float("nan"), 1.8592, 250000), #short 3m SONIA
+                  ('COR_offset2', 'CAD', 1, 6, 1, float("nan"), float("nan"), 1.000, 250000), #long 3m CORRA
+                  ('SFI_offset2', 'GBP', -1, 6, 1, float("nan"), float("nan"), 1.8592, 250000), #short 3m SONIA
+                  ('ER_offset2', 'EUR', 1, 7, 1, float("nan"), float("nan"), 1.5681, 250000), #long 3m EURIBOR
+                  ('SFI_offset2', 'GBP', -1, 7, 1, float("nan"), float("nan"), 1.8592, 250000), #short 3m SONIA
+                  ('SFR_offset2', 'USD', 1, 8, 1, float("nan"), float("nan"), 1.397, 250000), #long 3m SOFR
+                  ('ER_offset2', 'EUR', -1, 8, 1, float("nan"), float("nan"), 1.5681, 250000), #short 3m EURIBOR
+                  ('COR_offset2', 'CAD', 1, 9, 1, float("nan"), float("nan"), 1.000, 250000), #long 3m CORRA
+                  ('ER_offset2', 'EUR', -1, 9, 1, float("nan"), float("nan"), 1.5681, 250000), #short 3m EURIBOR
+                  ]
+OvernightDescs_adj = TransformTickerDescs(OvernightDescs, dv01_budget, AmountInvested)
+OvernightDict = OvernightDescs_adj.unpack_long_short()
+
+## In-sample best parameters (output stored as json and csv)
+store_params_on = pd.DataFrame(index=tickers_list)
+pnls_on = {}
+for pair in OvernightDict.keys():
+    tickers = OvernightDict[pair]['tickers']
+    currencies = OvernightDict[pair]['currencies']
+    if fix_fx:
+        currencies = ['CAD','CAD']
+    directions = OvernightDict[pair]['directions']
+    notionals = OvernightDict[pair]['notionals']
+    contracts = OvernightDict[pair]['contracts']
+    dv01s = OvernightDict[pair]['dv01s']
+    name = '_'.join(tickers)+'_spread'
+    print(f'Processing {name}')
+    scenarios = Engine.long_short_simplified(tickers, currencies, directions, notionals, contracts, dv01s, trade_cost_LS,
+                                               data, RelativePnL=relativePnL, decay=decay, decayrate=decayrate)
+    pnls_on[name] = scenarios
+    idx = scenarios[criteria_LS].idxmax()
+    if store_params_on.empty:
+        store_params_on = pd.DataFrame(columns=scenarios.columns)
+    store_params_on.loc[name, :] = scenarios.loc[idx]
+store_json(pnls_on, 'overnight spread in_sample.json')
+
+## Reducing overfit with cross-validation
+if run_CV:
+    cv_cc_on = {}
+    for pair in OvernightDict.keys():
+        tickers = OvernightDict[pair]['tickers']
+        currencies = OvernightDict[pair]['currencies']
+        if fix_fx:
+            currencies = ['CAD','CAD']
+        directions = OvernightDict[pair]['directions']
+        notionals = OvernightDict[pair]['notionals']
+        contracts = OvernightDict[pair]['contracts']
+        dv01s = OvernightDict[pair]['dv01s']
+        name = '_'.join(tickers)+'_spread'
+        print(f'Processing {name}')
+        df = data[pd.notnull(data[f'{tickers[0]}_mid']) & pd.notnull(data[f'{tickers[1]}_mid'])]
+        cv_cc_on[name] = {}
+        cv = CrossValidation(Engine, test_weight, df, shares, criteria_LS, cluster=cluster, cluster_size=5, glue=False)
+        cv_cc_on[name]['windows'], cv_cc_on[name]['avgs'] = cv.best_windows_LS(tickers, currencies, directions, notionals, contracts, dv01s, 
+                                                                               trade_cost_LS, RelativePnL=relativePnL, decay=decay, decayrate=decayrate)
+        print(cv_cc_on[name]['windows'])
+
+windows = {
+              3: [20, 150],
+              5: [10, 80],
+              6: [30, 190],
+              7: [25, 70],
+              8: [25, 70],
+              9: [10, 150],
+              }
+
+port_on = PortfolioMomentum(tickerdescs=OvernightDescs, budget=dv01_budget, AmtInvested=AmountInvested, trade_cost=trade_cost_LS, 
+                            data=data, sec_type='long_short', ls_windows=windows, relativePnL=relativePnL, decay=False, 
+                            decayrate=0.005, conditional_decay=True, condition=[100,300]).run_portfolio()
+
+for name in port_on.keys():
+    print(name)
+    print(performance_metrics(port_on[name]))
+    plot_cum_rtns(pd.DataFrame(port_on[name]['DailyReturn']))
+
+
+
+
+##################################################### SELECTED FUTURES #####################################################
+#ticker, ccy, CurrentDuration, Weight, MV/Contract, FXRate, ContractSizeLocal, fast_window, slow_window
+#Set ccy to CAD if we want constant-FX returns
+# FutDescs = [('TU', 'CAD', 1.9159, float("nan"), float("nan"), 1.397, 200000, 25, 65), #US 2yr
+#             ('FV', 'CAD', 4.4194, float("nan"), float("nan"), 1.397, 100000, 20, 50), #US 5yr
+#             ('UXY', 'CAD', 7.8153, float("nan"), float("nan"), 1.397, 100000, 20, 45), #US ultra 10yr
+#             ('CV', 'CAD', 1.917, float("nan"), float("nan"), 1.000, 100000, 25, 55), #CA 2yr
+#             ('XQ', 'CAD', 4.4424, float("nan"), float("nan"), 1.000, 100000, 10, 70), #CA 5yr
+#             ('DU', 'CAD', 1.9453, float("nan"), float("nan"), 1.568, 100000, 20, 70), #EU 2yr
+#             ('OE', 'CAD', 4.5144, float("nan"), float("nan"), 1.568, 100000, 20, 70), #EU 5yr
+#             ('BPSWS2 Curncy', 'CAD', 1.918, float("nan"), float("nan"), 1.8592, 100000, 30, 80), #UK 2yr SONIA
+#             ('BPSWS5 Curncy', 'CAD', 4.532, float("nan"), float("nan"), 1.8592, 100000, 30, 105), #UK 5yr SONIA
+#             ('BPSWS10 Curncy', 'CAD', 8.187, float("nan"), float("nan"), 1.8592, 100000, 35, 105), #UK 10yr SONIA
+#             ('SFR_offset2', 'CAD', 1, float("nan"), float("nan"), 1.397, 250000, 25, 55), #3m SOFR, rolled into 3rd contract
+#             ('COR_offset2', 'CAD', 1, float("nan"), float("nan"), 1.000, 250000, 35, 110), #3m CORRA, rolled into 3rd contract
+#             ('SFI_offset2', 'CAD', 1, float("nan"), float("nan"), 1.8592, 250000, 30, 80), #3m SONIA, rolled into 3rd contract
+#             ('ER_offset2', 'CAD', 1, float("nan"), float("nan"), 1.568, 250000, 10, 100), #3m SONIA, rolled into 3rd contract
+#             ]
+
+# # Equal DV01 budget
+# port = PortfolioMomentum(FutDescs, dv01_budget, AmountInvested, trade_cost, data, 'futures', relativePnL=relativePnL)
+# port.plot_against_HFRIMTF(maxLev=5, startdate='2021-01-01')
+# print(performance_metrics(port.consolidate_rtns()[port.consolidate_rtns().index >= '2021-01-01']))
+# portdecay = PortfolioMomentum(FutDescs, dv01_budget, AmountInvested, trade_cost, data, 'futures', relativePnL=relativePnL,
+#                               decay=decay, decayrate=decayrate, conditional_decay=True, condition=[100,170])
+# portdecay.plot_against_HFRIMTF(maxLev=5, startdate='2021-01-01')
+# print(performance_metrics(portdecay.consolidate_rtns()[portdecay.consolidate_rtns().index >= '2021-01-01']))
+
+# rtns = {}
+# for ticker, currency, notional, weight, contracts, dv01, *_, fast, slow in port.adj_descs:
+#     if fix_fx:
+#         currency = 'CAD'
+#     rtns[ticker] = cross_over_strategy(ticker, currency, notional, contracts, dv01, trade_cost, fast, slow, data, RelativePnL=relativePnL)
+#     if len(rtns[ticker]) > 0:
+#         print(f'{ticker} no decay')
+#         print(performance_metrics(rtns[ticker]))
+#         print('Cumulative Return', rtns[ticker].loc[str(rtns[ticker].index.max()),'CumulativeReturn'])
+#     rtns[f'{ticker} decay'] = cross_over_strategy(ticker, currency, notional, contracts, dv01, trade_cost, fast, slow, data, RelativePnL=relativePnL, decay=decay, decayrate=decayrate)
+#     if len(rtns[f'{ticker} decay']) > 0:
+#         print(f'{ticker} with decay')
+#         print(performance_metrics(rtns[f'{ticker} decay']))
+#         print('Cumulative Return', rtns[f'{ticker} decay'].loc[str(rtns[f'{ticker} decay'].index.max()),'CumulativeReturn'])
+#         print()
+#     plot_cum_rtns(pd.DataFrame(rtns[ticker]['DailyReturn']), title=ticker, fname='Save', additive=True, save=False)
+#     plot_cum_rtns(pd.DataFrame(rtns[f'{ticker} decay']['DailyReturn']), title=f'{ticker} decay', fname='Save', additive=True, save=False)
+
+# # Update weights using MVO
+# port.update_mvo_weights()
+# port.plot_against_HFRIMTF(maxLev=5, startdate='2021-01-01')
+# print(performance_metrics(port.consolidate_rtns()[port.consolidate_rtns().index >= '2021-01-01']))
+# portdecay.update_mvo_weights()
+# portdecay.plot_against_HFRIMTF(maxLev=5, startdate='2021-01-01')
+# print(performance_metrics(portdecay.consolidate_rtns()[portdecay.consolidate_rtns().index >= '2021-01-01']))
