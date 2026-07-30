@@ -1,0 +1,448 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.ndimage import uniform_filter
+import seaborn as sns
+from statsmodels.tsa.stattools import adfuller
+from statsmodels.tsa.arima.model import ARIMA
+from statsmodels.api import OLS, add_constant
+
+
+def arimax_model(data, pred_col, exo_cols=None, p=1, q=1, x=1, constant=False):
+    if exo_cols is None:
+        exo_cols = []
+    cols = ['Date', pred_col] + exo_cols
+    df = data[cols].copy()
+    df['Date'] = pd.to_datetime(df['Date'])
+    df.set_index('Date', inplace=True)
+    df = df.sort_index()
+    df = df.dropna()
+    y_diff = df[[pred_col]].diff()
+    if exo_cols:
+        exo_df = pd.DataFrame(index=df.index)
+        for col in exo_cols:
+            for lag in range(1, x + 1):
+                exo_df[f"{col}_lag{lag}"] = df[col].shift(lag)
+        combined = pd.concat([y_diff, exo_df], axis=1).dropna()
+        y_diff = combined[[pred_col]]
+        X = combined.drop(columns=[pred_col])
+    else:
+        combined = y_diff.dropna()
+        y_diff = combined[[pred_col]]
+        X = None
+    if y_diff.empty:
+        raise ValueError(
+            f"After differencing/lagging, no usable data remains. "
+            f"Original length={len(df)}, after trimming={len(y_diff)} "
+            f"(p={p}, q={q}, x={x})"
+        )
+    trend = 'c' if constant else 'n'
+    print(f"Effective sample size after differencing/lagging: {len(y_diff)}")
+    model = ARIMA(endog=y_diff, exog=X, order=(p, 0, q), trend=trend)
+    return model
+
+
+def multi_ols_ma(data, pred_col, exo_cols=None, shift=1,
+                 p=1, pskip=1, q=1, qskip=1, n=1, nskip=1, constant=False):
+    if exo_cols is None:
+        exo_cols = []
+    cols = ['Date', pred_col] + exo_cols
+    df = data[cols].copy()
+    df.set_index('Date', inplace=True)
+    df = df.sort_index()
+    df = df.dropna()
+    y = df[pred_col].diff()
+    cols_dict = {}
+    for lag in range(1, p+1, pskip):
+        cols_dict[f'{pred_col}_{lag}d_delta'] = y.rolling(lag).sum()
+    for exo_col in exo_cols:
+        for lag in range(0, n, nskip):
+            cols_dict[f'{exo_col}_lag{lag+1}'] = df[exo_col].shift(lag)
+    x = pd.DataFrame(cols_dict, index=y.index)
+    x = x.shift(shift)
+    combined = pd.concat([x,y], axis=1).dropna()
+    y_reg = combined[pred_col]
+    x_reg = combined.drop(columns=[pred_col])
+    if constant:
+        x_reg = add_constant(x_reg)
+    model = OLS(y_reg, x_reg).fit()
+    resid = model.resid
+    for lag in range(1, q+1, qskip):
+        x_reg[f'residual_lag{lag}'] = resid.shift(lag)
+    valid = ~x_reg.isna().any(axis=1)
+    y_final = y_reg[valid]
+    x_final = x_reg[valid]
+    final_model = OLS(y_final, x_final)
+    return final_model
+
+
+def walk_forward_multi_ols_ma(data, pred_col, exo_cols=None, train_window=500, constant=False, 
+                              p=100, pskip=1, q=1, qskip=1, n=1, nskip=1, shift=1):
+    """
+    Walk-forward forecast using multi_ols_ma for actual values.
+
+    Predicts one step ahead recursively over the dataset, using a rolling training window.
+    Converts predicted deltas into actual values by adding them to the previous observation.
+
+    Parameters
+    ----------
+    data : pd.DataFrame
+        DataFrame containing the prediction column and optional exogenous columns.
+        Must have a 'Date' column.
+    pred_col : str
+        Name of the column to forecast.
+    exo_cols : list of str, optional
+        List of exogenous columns to include in the regression.
+    p : int, default=1
+        Number of autoregressive lags of the target variable.
+    q : int, default=1
+        Number of lagged residuals to include.
+    n : int, default=100
+        Number of lags of exogenous variables.
+    train_window : int, default=500
+        Number of observations in each rolling training window.
+    constant : bool, default=False
+        Whether to include a constant in the regression.
+    shift : int, default=1
+        Shift of predictors relative to target.
+
+    Returns
+    -------
+    pd.DataFrame
+        Original DataFrame with a new column `'forecasted {pred_col}'` containing the
+        one-step-ahead forecasts aligned with the original index.
+    """
+    df = data.copy()
+    required_cols = ['Date', pred_col] + (exo_cols if exo_cols else [])
+    df = df[required_cols].dropna().reset_index(drop=True)
+    forecasts = []
+    start_idx = max(p, q, n) + train_window
+    for i in range(start_idx, len(df)):
+        train_df = df.iloc[i-train_window:i].reset_index(drop=True)
+        try:
+            model = multi_ols_ma(
+                data=train_df,
+                pred_col=pred_col,
+                exo_cols=exo_cols,
+                p=p, q=q, n=n,
+                pskip=pskip, qskip=qskip, nskip=nskip,
+                constant=constant,
+                shift=shift
+            ).fit()
+        except Exception:
+            forecasts.append((df.loc[i, 'Date'], np.nan))
+            continue
+        if model.model.exog.shape[0] == 0:
+            forecasts.append((df.loc[i, 'Date'], np.nan))
+            continue
+        try:
+            delta_pred = model.predict(model.model.exog[-1:])[0]
+            y_pred_actual = delta_pred
+        except Exception:
+            y_pred_actual = np.nan
+        forecasts.append((df.loc[i, 'Date'], y_pred_actual))
+    fcast_series = pd.Series(dict(forecasts), name=f'forecasted {pred_col}')
+    df = df.set_index('Date')
+    df = df.join(fcast_series)
+    return df
+
+
+def adf_test(ts, column=None, maxlag=None, regression='c', autolag='AIC'):
+    """
+    Perform Augmented Dickey-Fuller test for stationarity.
+
+    Parameters
+    ----------
+    ts : pd.Series or pd.DataFrame
+        Time series data, indexed by time.
+    column : str, optional
+        Column to test if ts is a DataFrame. If None and ts is a DataFrame, the first column is used.
+    maxlag : int, optional
+        Maximum lag to use. Default None lets the function choose automatically.
+    regression : {'c','ct','ctt','nc'}
+        Constant/trend assumption:
+            'c'   : constant only (default)
+            'ct'  : constant + linear trend
+            'ctt' : constant + linear + quadratic trend
+            'nc'  : no constant
+    autolag : {'AIC','BIC','t-stat', None}
+        How to choose lag length when maxlag is None.
+
+    Returns
+    -------
+    p_value : float
+        The p-value of the test. Small p (< 0.05) rejects null of non-stationarity.
+    """
+    if isinstance(ts, pd.DataFrame):
+        if column is None:
+            column = ts.columns[0]
+        ts = ts[column]
+    ts = ts.dropna()
+    result = adfuller(ts, maxlag=maxlag, regression=regression, autolag=autolag)
+    return result
+
+
+def store_json(dict, name='save.json'):
+    """
+    Stores a dictionary of pandas DataFrames as a JSON file.
+
+    Each DataFrame is converted to a nested dictionary using `to_dict()`, which is JSON serializable.
+    
+    Args:
+        dict (dict): Dictionary where keys are strings and values are pandas DataFrames.
+        name (str): Name of the output JSON file. Defaults to 'save.json'.
+    """
+    import json
+    serializable_pnls = {k: v.to_dict() for k, v in dict.items()}
+    with open(name, 'w') as f:
+        json.dump(serializable_pnls, f, indent=4)
+
+
+def load_json(name):
+    """
+    Loads a JSON file into a dictionary of pandas DataFrames.
+
+    Assumes the JSON was created using `store_json` where each value is a nested dictionary 
+    compatible with `pd.DataFrame`.
+
+    Args:
+        name (str): Path to the JSON file.
+
+    Returns:
+        dict: Dictionary where keys are strings and values are pandas DataFrames.
+    """
+    import json
+    with open(name, "r") as f:
+        json_dict = json.load(f)
+    df_dict = {k: pd.DataFrame(v) for k, v in json_dict.items()}
+    return df_dict
+
+
+def decay_moving_avg(series, window, decayrate):
+    """
+    Calculate a decayed moving average of a time series using exponential decay.
+
+    Parameters:
+    series (pd.Series): The input time series data.
+    window (int): The number of past observations to consider in the moving average.
+    decayrate (float): The decay rate per time step (0 means no decay; higher values apply faster decay).
+
+    Returns:
+    pd.Series: A series containing the decayed moving average values.
+
+    Notes:
+    - More recent observations are weighted more heavily according to the formula:
+        weight_i = (1 - decayrate) ** i, where i = 0 is the most recent.
+    - If decayrate is 0.0, this function defaults to a simple moving average.
+    - For early time points with fewer than `window` observations, weights are truncated accordingly.
+    """
+    if decayrate == 0.0:
+        return series.rolling(window=window).mean()
+    weights = np.array([(1-decayrate)**i for i in range(window)])
+    weights = weights[::-1]
+
+    def weighted_avg(x):
+        if len(x) < window:
+            w = weights[-len(x):]
+            return np.dot(x, w) / w.sum()
+        else:
+            return np.dot(x,weights) / weights.sum()
+    
+    return series.rolling(window=window).apply(weighted_avg, raw=True)
+
+def cluster_maxidx(df, window):
+    """
+    Ensure the window size is odd, perform clustering, and return the index and column names of the highest number in the cluster.
+    
+    Parameters:
+    df (pd.DataFrame): The input dataframe.
+    window (int): The window size (N), representing an NxN box around the centroid.
+    
+    Returns:
+    tuple: The index (slow_window) and column (fast_window) names of the highest number in the cluster.
+    """
+    if window % 2 == 0: # force window to be odd so each cluster centers on the representative window
+        window += 1
+    fill = df.mean().mean() # fill NaN and extend df border with the mean value
+    clustered = pd.DataFrame(uniform_filter(df.fillna(fill), size=window, mode='constant', cval=fill), index=df.index, columns=df.columns)
+    max_index = clustered.stack().idxmax()
+    return max_index # max_index: slow_window, max_index: fast_window
+
+def blp_slope(y):
+    """
+    Compute the slope (beta_1) of y ~ time using OLS closed-form formula.
+    y: 1D array of values for the window.
+    Returns the slope as a float.
+    """
+    n = len(y)
+    x = np.arange(n)
+    x_mean = x.mean()
+    y_mean = y.mean()
+    cov_xy = ((x - x_mean) * (y - y_mean)).sum()
+    var_x = ((x - x_mean) ** 2).sum()
+    return cov_xy / var_x
+
+def rolling_slope(series, window):
+    """
+    Vectorized rolling slope using an external slope function.
+    Returns a Series aligned with the original index.
+    """
+    return series.rolling(window).apply(blp_slope, raw=True)
+
+def plot_series(df, title='', fname='Save', save=False):
+    """
+    Plots a time series from a DataFrame.
+
+    Parameters:
+    df (pd.DataFrame): The DataFrame containing the time series data.
+    title (str): The title of the plot.
+    fname (str): The filename to save the figure as.
+    save (bool): Whether to save the figure or not.
+
+    Returns:
+    None
+    """
+    plt.figure(figsize=(9, 6))
+    for col in df:
+        plt.plot(df[col], label=col)
+    plt.grid(True)
+    plt.legend()
+    plt.title(title)
+    plt.xlabel('Date')
+    plt.ylabel('Value')
+    if save:
+        plt.savefig(fname)
+    plt.show()
+
+def plot_heatmap(df, annot=False, title='', fname='Heatmap', save=False):
+    """
+    Plot a heatmap from a DataFrame using seaborn.
+
+    Parameters:
+    df (DataFrame): The data to visualize as a heatmap.
+    annot (bool): If True, display the numeric value in each cell.
+    title (str): Title of the heatmap (currently unused).
+    fname (str): File name to save the heatmap image if save=True.
+    save (bool): If True, saves the heatmap to the specified file name.
+
+    Returns:
+    None
+    """
+    plt.figure(figsize=(20,10))
+    sns.heatmap(df, cmap='YlGnBu', annot=annot, fmt='.0f')
+    plt.tight_layout()
+    if save:
+        plt.savefig(fname)
+    plt.show()
+
+def plot_3d_surface(df, title='', xlabel='', ylabel='', zlabel='', fname='3d surface', save=False):
+    """
+    Plots a 3D surface from a DataFrame where index and columns represent the X and Y axes,
+    and the values represent the Z axis.
+
+    Parameters:
+        df (pd.DataFrame): A DataFrame with numeric index and columns. 
+                           The index represents Y values, columns represent X values.
+        title (str): Title of the plot.
+        xlabel (str): Label for the X-axis.
+        ylabel (str): Label for the Y-axis.
+        zlabel (str): Label for the Z-axis.
+        fname (str): Filename to save the plot (only used if save=True).
+        save (bool): If True, saves the plot to a file using `fname`.
+
+    Returns:
+        None
+    """
+    X_vals = np.array(df.index, dtype=float)
+    Y_vals = np.array(df.columns, dtype=float)
+    X, Y = np.meshgrid(Y_vals, X_vals)
+    Z = df.values.astype(float)
+    fig = plt.figure(figsize=(12, 8))
+    ax = fig.add_subplot(111, projection='3d')
+    surf = ax.plot_surface(X, Y, Z, cmap='YlGnBu', edgecolor='k')
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_zlabel(zlabel)
+    ax.set_title(title)
+    fig.colorbar(surf, ax=ax, shrink=0.5, aspect=10)
+    plt.tight_layout()
+    if save:
+        plt.savefig(fname)
+    plt.show()
+
+def get_cum_rtns(returns, additive=True):
+    """
+    Calculate cumulative returns.
+
+    Parameters:
+    returns (pd.DataFrame): DataFrame of returns in decimals. The index must be datetime.
+    additive (bool): If True, use additive returns. Otherwise, use multiplicative returns.
+
+    Returns:
+    pd.DataFrame: DataFrame of cumulative returns.
+    """
+    returns.index = pd.to_datetime(returns.index)
+    if additive:   
+        return returns.cumsum()
+    else:
+        return (1 + returns).cumprod() - 1
+
+def plot_cum_rtns(df, title='', fname='Save', additive=True, save=False, dotted_series=None, bold_series=None):
+    """
+    Plots multiple cumulative returns. 
+    
+    Parameters:
+    df (pd.DataFrame): DataFrame of returns in decimals. The index must be datetime.
+    title (str): Title of the plot.
+    fname (str): Name to save the file as.
+    additive (bool): If True, use additive returns. Otherwise, use multiplicative returns.
+    save (bool): If true, saves the file.
+    dotted_series (str): Name of the series to be plotted with a dotted line.
+    bold_series (str): Name of the series to be plotted with bold line.
+
+    Returns:
+    None
+    """
+    cum_ret = get_cum_rtns(df, additive)
+    plt.figure(figsize=(9, 6))
+    for series in cum_ret:
+        linestyle = 'dotted' if series == dotted_series else 'solid'
+        linewidth = 2.5 if series == bold_series else 1.2
+        plt.plot(cum_ret[series], label=series, linestyle=linestyle, linewidth=linewidth)
+    plt.grid(True)
+    plt.legend()
+    plt.title(title)
+    plt.xlabel('Date')
+    plt.ylabel('Return')
+    if save:
+        plt.savefig(fname)
+    plt.show()
+
+def calc_avg_hold(data):
+    tot_days = len(data)
+    switches = data['Signal'].diff().abs().sum()/2
+    return tot_days/switches
+
+def millions(x, pos):
+    'The two args are the value and tick position'
+    return '%1.0fM' % (x*1e-6)
+
+def calc_mdd(df, col='DailyReturn', compound=False):
+    if compound:
+        cumulative = (1 + df[col]).cumprod()
+        peak = cumulative.cummax()
+        return -(cumulative/peak - 1).min()
+    else:
+        cumulative = df[col].cumsum()
+        peak = cumulative.cummax()
+        return -(cumulative - peak).min()
+
+def divide_chunks(lst, n):
+    for j in range(0, len(lst), n): 
+        yield lst[j : j+n]
+
+def relu(x):
+    return np.maximum(0,x)
+
+def exp_reg(x, multiplier):
+    return np.exp(-multiplier * x)
