@@ -1,0 +1,637 @@
+import pandas as pd
+import numpy as np
+from .momentum_functions import TransformTickerDescs, cross_over_strategy, cross_over_strategy_long_short
+from .util_function import plot_cum_rtns, plot_series
+from .sql_handler import get_HFRIMTF
+import riskfolio as rf
+import cvxpy as cp
+cp.settings.SOLVER = 'ECOS_BB'
+
+class PortfolioMomentum:
+    """
+    A class to construct, optimize, and evaluate a momentum-based futures or long-short portfolio.
+
+    Attributes:
+        tickerdescs (list): Ticker metadata including notional, weights, and strategy parameters.
+        budget (float): Total capital allocated.
+        AmtInvested (float): Amount currently invested.
+        trade_cost (float): Transaction cost per contract.
+        data (pd.DataFrame): Price/return data with date index.
+        sec_type (str): Strategy type: 'futures' or 'long_short'.
+        relativePnL (bool): If True, returns are weighted by allocation.
+        decay (bool): If True, apply exponential decay to returns.
+        decayrate (float): Rate used for exponential decay.
+        conditional_decay (bool): If True, apply decay conditionally.
+        condition (tuple): Fast/slow MA window bounds to apply decay.
+        ls_windows (dict): Long-short MA window configurations.
+        rolling_mvo_weights (pd.DataFrame): Time series of optimized weights.
+        rolling_mvo_contracts (pd.DataFrame): Time series of calculated contracts.
+        rolling_mvo_results (pd.Series): Daily net return series.
+
+    Methods:
+        run_portfolio():
+            Executes crossover strategy per asset or spread.
+
+        consolidate_rtns():
+            Merges individual asset/spread returns into a portfolio-level DataFrame.
+
+        update_mvo_weights(rfrate=0, criteria='Sharpe', min_w=0.0):
+            Applies Mean-Variance Optimization to update weights and contracts.
+
+        get_rolling_weights(window, rfrate, criteria, min_w):
+            Computes rolling MVO weights over a sliding window.
+
+        get_rolling_contracts():
+            Derives rolling contracts per asset based on rolling MVO weights.
+
+        calculate_rolling_results(window, rfrate, criteria, min_w):
+            Computes gross and net returns with rolling MVO and trading costs.
+
+        compare_HFRIMTF(maxLev, rolling_mvo=False):
+            Compares portfolio monthly returns vs. HFRI MTF under leverage.
+
+        plot_against_HFRIMTF(maxLev, startdate, rolling_mvo=False):
+            Plots cumulative returns of portfolio vs. HFRI MTF benchmark.
+
+        fill_rolling_mvo_weights():
+            Fills missing or zero-sum weight days in rolling_mvo_weights using current static weights.
+    """
+    def __init__(self, tickerdescs, budget, AmtInvested, trade_cost, data, sec_type, relativePnL=False, momentum_2nd_order=False,
+                 ignore_1st_order=False, decay=False, decayrate=None, conditional_decay=False, condition=None, ls_windows=None,
+                 dynamic_alloc=False, blp_slope=False, wait_days=1):
+        """
+        Initializes the portfolio/trading strategy object with user-defined parameters and data inputs.
+
+        Parameters
+        ----------
+        tickerdescs : list or dict
+            List or dictionary of security descriptions including tickers, weights, and associated parameters.
+
+        budget : float
+            The total notional capital allocated for the strategy.
+
+        AmtInvested : float
+            The actual amount invested in the strategy (can differ from the budget for leverage or liquidity reasons).
+
+        trade_cost : float
+            Per-unit transaction cost assumed for executing trades.
+
+        data : pd.DataFrame
+            Market data for the strategy, typically containing prices, returns, and signals.
+
+        sec_type : str
+            Type of security or strategy to use. Examples include 'futures', 'long_short', etc.
+            Determines which transformation and setup logic to apply.
+
+        relativePnL : bool, optional
+            If True, PnL will be calculated relative to a benchmark or base portfolio.
+
+        momentum_2nd_order : bool, optional
+            If True, enables a second-order momentum filter or condition during allocation.
+
+        ignore_1st_order : bool, optional
+            If True, bypasses first-order momentum signals and proceeds with higher-order logic only.
+
+        decay : bool, optional
+            If True, applies exponential decay weighting to signals or allocations.
+
+        decayrate : float, optional
+            The decay rate to apply if `decay` is True. Should be a number between 0 and 1.
+
+        conditional_decay : bool, optional
+            If True, decay is only applied under certain conditions defined by `condition`.
+
+        condition : callable or any, optional
+            A function or condition used in conjunction with `conditional_decay` to control when decay is applied.
+
+        ls_windows : tuple or list, optional
+            Time windows used for long-short strategies, e.g., lookback periods for signal computation.
+
+        dynamic_alloc : bool, optional
+            If True, enables dynamic allocation logic, possibly rebalancing or reoptimizing weights over time.
+
+        Attributes
+        ----------
+        adj_descs : list or dict
+            Adjusted ticker descriptions based on the transformed `tickerdescs` input.
+
+        tickers : list
+            List of individual tickers extracted from `tickerdescs`.
+
+        unpacked : tuple, optional
+            Unpacked components for long-short strategies (only defined when `sec_type == 'long_short'`).
+
+        rolling_mvo_weights : pd.DataFrame or None
+            Placeholder for storing weights from a rolling mean-variance optimization (if used).
+
+        rolling_mvo_contracts : pd.DataFrame or None
+            Placeholder for storing contract-level allocations from rolling optimization.
+
+        rolling_mvo_results : pd.DataFrame or None
+            Placeholder for performance or diagnostics from the rolling optimizer.
+
+        Notes
+        -----
+        - Depends on `TransformTickerDescs` for ticker handling logic.
+        - Different behavior is applied based on the `sec_type` selected.
+        - This constructor does not perform any allocation or trading logic by itself.
+        """
+        self.tickerdescs = tickerdescs
+        self.budget = budget
+        self.AmtInvested = AmtInvested
+        self.trade_cost = trade_cost
+        self.data = data
+        self.relativePnL = relativePnL
+        self.sec_type = sec_type
+        transform = TransformTickerDescs(self.tickerdescs, self.budget, self.AmtInvested)
+        self.adj_descs = getattr(transform, self.sec_type)()
+        self.tickers = transform.tickers()
+        self.momentum_2nd = momentum_2nd_order
+        self.ignore_1st_order = ignore_1st_order
+        self.blp_slop = blp_slope
+        self.decay = decay
+        self.decayrate=decayrate
+        self.conditional_decay = conditional_decay
+        self.condition = condition
+        if sec_type == 'long_short':
+            self.unpacked = transform.unpack_long_short()
+            self.ls_windows = ls_windows
+        self.rolling_mvo_weights = None
+        self.rolling_mvo_contracts = None
+        self.rolling_mvo_results = None
+        self.dynamic_alloc = dynamic_alloc
+        self.wait_days = wait_days
+
+    def run_portfolio(self):
+        """
+        Runs the crossover strategy for each ticker or long-short spread.
+
+        Returns:
+            dict: Keys are tickers (or spread names), values are dictionaries of results,
+                  typically including 'DailyReturn' and related metrics.
+        """
+        pnls = {}
+        if self.sec_type == 'futures':
+            for ticker, curr, notional, weight, contracts, dv01, *_, fast, slow, fslope, sslope, buffer in self.adj_descs:
+                if self.conditional_decay and not (self.condition[0] <= slow <= self.condition[1]):
+                    pnls[ticker] = cross_over_strategy(ticker=ticker, curr=curr, notional=notional, contracts=contracts, dv01=dv01, cost=self.trade_cost, 
+                                                       fast_window=fast, slow_window=slow, df=self.data, momentum_2nd=self.momentum_2nd, fast_slope=fslope, 
+                                                       slow_slope=sslope, buffer_2nd=buffer, RelativePnL=self.relativePnL, dynamic_alloc=self.dynamic_alloc,
+                                                       wait_days=self.wait_days, blp_slope=self.blp_slop)
+                else:
+                    pnls[ticker] = cross_over_strategy(ticker=ticker, curr=curr, notional=notional, contracts=contracts, dv01=dv01, cost=self.trade_cost, 
+                                                       fast_window=fast, slow_window=slow, df=self.data, momentum_2nd=self.momentum_2nd, fast_slope=fslope, 
+                                                       slow_slope=sslope, buffer_2nd=buffer, RelativePnL=self.relativePnL, dynamic_alloc=self.dynamic_alloc,
+                                                       decay=self.decay, decayrate=self.decayrate, wait_days=self.wait_days, blp_slope=self.blp_slop)
+        elif self.sec_type == 'long_short':
+            for pair in self.unpacked.keys():
+                name = '_'.join(self.unpacked[pair]['tickers'])+'_spread'
+                fast, slow, fslope, sslope, buffer = self.ls_windows[pair]
+                if self.conditional_decay and not (self.condition[0] <= slow <= self.condition[1]):
+                    pnls[name] = cross_over_strategy_long_short(ticker=self.unpacked[pair]['tickers'], currency=self.unpacked[pair]['currencies'], 
+                                                                direction=self.unpacked[pair]['directions'], notional=self.unpacked[pair]['notionals'], 
+                                                                contracts=self.unpacked[pair]['contracts'], dv01=self.unpacked[pair]['dv01s'],
+                                                                cost=self.trade_cost, fast_window=fast, slow_window=slow, df=self.data, 
+                                                                momentum_2nd=self.momentum_2nd, fast_slope=fslope, slow_slope=sslope, buffer_2nd=buffer,
+                                                                RelativePnL=self.relativePnL, ignore_1st_order=self.ignore_1st_order, dynamic_alloc=self.dynamic_alloc,
+                                                                wait_days=self.wait_days, blp_slope=self.blp_slop)
+                else:
+                    pnls[name] = cross_over_strategy_long_short(ticker=self.unpacked[pair]['tickers'], currency=self.unpacked[pair]['currencies'], 
+                                                                direction=self.unpacked[pair]['directions'], notional=self.unpacked[pair]['notionals'], 
+                                                                contracts=self.unpacked[pair]['contracts'], dv01=self.unpacked[pair]['dv01s'],
+                                                                cost=self.trade_cost, fast_window=fast, slow_window=slow, df=self.data, 
+                                                                momentum_2nd=self.momentum_2nd, fast_slope=fslope, slow_slope=sslope, buffer_2nd=buffer,
+                                                                RelativePnL=self.relativePnL, decay=self.decay, decayrate=self.decayrate, 
+                                                                ignore_1st_order=self.ignore_1st_order, dynamic_alloc=self.dynamic_alloc,
+                                                                wait_days=self.wait_days, blp_slope=self.blp_slop)
+        return pnls
+
+    def consolidate_rtns(self):
+        """
+        Consolidates the individual asset or spread returns into a single portfolio-level DataFrame.
+
+        Returns:
+            pd.DataFrame: Contains each asset's weighted/unweighted daily return, total daily return,
+                        and cumulative return of the portfolio.
+        """
+        results_dict = self.run_portfolio()
+        resultPnL = pd.DataFrame()
+        metadata = []
+        if self.sec_type == 'futures':
+            for ticker, curr, notional, weight, *_ in self.adj_descs:
+                df = results_dict[ticker][['DailyReturn']].copy()
+                name = ticker
+                metadata.append((name, weight, df))
+        elif self.sec_type == 'long_short':
+            for pair in self.unpacked.keys():
+                name = '_'.join(self.unpacked[pair]['tickers']) + '_spread'
+                weight = sum(abs(wgt) for wgt in self.unpacked[pair]['weights'])
+                df = results_dict[name][['DailyReturn']].copy()
+                metadata.append((name, weight, df))
+        for name, weight, df in metadata:
+            df.rename(columns={'DailyReturn': f'{name}_DailyReturn_unweighed'}, inplace=True)
+            df[f'{name}_DailyReturn'] = df[f'{name}_DailyReturn_unweighed'] * weight if self.relativePnL else df[f'{name}_DailyReturn_unweighed']
+            resultPnL = pd.merge(resultPnL, df, how='outer', left_index=True, right_index=True)
+        for col in resultPnL.columns:
+            if col.endswith('_DailyReturn_unweighed') or col.endswith('_DailyReturn'):
+                first_valid = resultPnL[col].first_valid_index()
+                if first_valid is not None:
+                    resultPnL.loc[first_valid:, col] = resultPnL.loc[first_valid:, col].fillna(0)
+        for name, weight, _ in metadata:
+            col = f'{name}_DailyReturn'
+            resultPnL[f'{name}_weight'] = resultPnL[col].apply(lambda x: np.nan if pd.isnull(x) else weight)
+        daily_cols = [col for col in resultPnL.columns if col.endswith('_DailyReturn')]
+        resultPnL['DailyReturn'] = resultPnL[daily_cols].sum(axis=1)
+        weight_cols = [col for col in resultPnL.columns if col.endswith('_weight')]
+        resultPnL['TotalWeight'] = resultPnL[weight_cols].sum(axis=1)
+        resultPnL['DailyReturn'] = resultPnL['DailyReturn'] / resultPnL['TotalWeight']
+        resultPnL['CumulativeReturn'] = resultPnL['DailyReturn'].cumsum()
+        return resultPnL
+
+    def update_mvo_weights(self, rfrate=0, criteria='Sharpe', min_w=0.0):
+        """
+        Updates portfolio weights and contract allocations using Mean-Variance Optimization (MVO).
+
+        Parameters:
+            rfrate (float): The risk-free rate to use in Sharpe ratio optimization (default = 0).
+            critera (str): defaults to Sharpe, the criteria to optimize against.
+            min_w (float): minimum weight on each security.
+
+        Returns:
+            pd.DataFrame: A DataFrame of optimized weights indexed by asset names.
+        """
+        self.relativePnL = True
+        rtns_df = self.consolidate_rtns().filter(like='_DailyReturn_unweighed').dropna()
+        port = rf.Portfolio(returns=rtns_df)
+        port.assets_stats(method_mu='hist', method_cov='hist')
+        port.lowerw = min_w
+        port.upperw = 1
+        wgt = port.optimization(model='Classic', rm='MV', obj=criteria, rf=rfrate)
+        if self.sec_type == 'futures':
+            for i, ticker in enumerate(self.tickers):
+                scale = wgt.loc[f'{ticker}_DailyReturn_unweighed', 'weights'] / self.adj_descs[i][3]
+                new_contracts = int(self.adj_descs[i][4] * scale)
+                new_notional = new_contracts * self.adj_descs[i][6] * self.adj_descs[i][7]
+                new_weight = wgt.loc[f'{ticker}_DailyReturn_unweighed', 'weights']
+                self.adj_descs[i] = self.adj_descs[i][:2] + (new_notional, new_weight, new_contracts) + self.adj_descs[i][5:]
+            total_notional = sum(desc[2] for desc in self.adj_descs)
+            for i, ticker in enumerate(self.tickers):
+                new_weight = self.adj_descs[i][2] / total_notional
+                self.adj_descs[i] = self.adj_descs[i][:3] + (new_weight,) + self.adj_descs[i][4:]
+        elif self.sec_type == 'long_short':
+            for pair in self.unpacked.keys():
+                name = '_'.join(self.unpacked[pair]['tickers'])+'_spread'
+                scale = wgt.loc[f'{name}_DailyReturn_unweighed', 'weights'] / sum(abs(wgt) for wgt in self.unpacked[pair]['weights'])
+                self.unpacked[pair]['weights'] = [scale*wgt for wgt in self.unpacked[pair]['weights']]
+                self.unpacked[pair]['contracts'] = [int(scale*contract) for contract in self.unpacked[pair]['contracts']]
+                self.unpacked[pair]['notionals'] = [contract*contract_size for contract, contract_size in zip(self.unpacked[pair]['contracts'], self.unpacked[pair]['contract_sizes'])]
+            total_notional = sum([sum([abs(notional) for notional in self.unpacked[pair]['notionals']]) for pair in self.unpacked.keys()])
+            for pair in self.unpacked.keys():
+                self.unpacked[pair]['weights'] = [notional/total_notional for notional in self.unpacked[pair]['notionals']]
+        return wgt
+
+    def get_rolling_weights(self, window=100, rfrate=0, criteria='Sharpe', min_w=0.0):
+        """
+        Runs a rolling Mean-Variance Optimization (MVO) using Riskfolio-Lib.
+
+        Args:
+            window (int): Rolling window size in days.
+            rfrate (float): Risk-free rate.
+            criteria (str): Objective function for optimization.
+            min_w (float): Minimum weight per asset.
+
+        Returns:
+            weights_df (pd.DataFrame): Daily MVO weights with columns in the format '{name}_weight'.
+        """
+        import warnings
+        self.relativePnL = True
+        rtns = self.consolidate_rtns().filter(like='_DailyReturn_unweighed')
+        weights_list = []
+        dates = rtns.index[window:]
+        full_tickers = rtns.columns
+        last_weights = pd.Series([0] * len(full_tickers), index=full_tickers)
+        for i in range(window, len(rtns)):
+            sub_rtns = rtns.iloc[i - window:i]
+            sub_rtns = sub_rtns.dropna(axis=1, how='all')
+            if sub_rtns.shape[1] == 0:
+                curr_weights = last_weights.copy()
+            else:
+                try:
+                    sub_rtns = sub_rtns.fillna(0)
+                    port = rf.Portfolio(returns=sub_rtns)
+                    port.assets_stats(method_mu='hist', method_cov='hist')
+                    port.lowerret = min_w
+                    port.upperret = 1
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        weights = port.optimization(model='Classic', rm='MV', obj=criteria, rf=rfrate)
+                    curr_weights = pd.Series(0, index=full_tickers)
+                    curr_weights.loc[weights.index] = weights['weights']
+                    last_weights = curr_weights.copy()
+                except Exception:
+                    curr_weights = last_weights.copy()
+            weights_list.append(curr_weights)
+        weights_df = pd.DataFrame(weights_list, index=dates)
+        rename_map = {col: f"{col.replace('_DailyReturn_unweighed', '')}_weight" for col in weights_df.columns}
+        weights_df.rename(columns=rename_map, inplace=True)
+        self.rolling_mvo_weights = weights_df
+        return weights_df
+
+    def fill_rolling_mvo_weights(self):
+        """
+        Fills any dates in self.rolling_mvo_weights where the sum of weights is 0,
+        using the current weights from self.adj_descs.
+        """
+        if self.rolling_mvo_weights is None:
+            raise ValueError("rolling_mvo_weights not initialized. Run get_rolling_weights first.")
+        replacement_weights = {
+            f"{desc[0]}_weight": desc[3] for desc in self.adj_descs if desc[3] > 0
+        }
+        replacement_series = pd.Series(replacement_weights)
+        for idx in self.rolling_mvo_weights.index:
+            if self.rolling_mvo_weights.loc[idx].sum() == 0:
+                self.rolling_mvo_weights.loc[idx] = replacement_series.reindex(self.rolling_mvo_weights.columns).fillna(0)
+
+    def get_rolling_contracts(self):
+        """
+        Given rolling MVO weights, recalculates the number of contracts required per asset per date.
+
+        Parameters:
+            weights_df (pd.DataFrame): DataFrame of rolling weights, with columns like 'ZB_weight', etc.
+
+        Returns:
+            contracts_df (pd.DataFrame): Same shape as weights_df, with integer number of contracts per date/asset.
+        """
+        if self.sec_type != 'futures':
+            raise NotImplementedError("Only 'futures' contract recalculation is currently supported.")
+        contracts_df = pd.DataFrame(index=self.rolling_mvo_weights.index, columns=self.rolling_mvo_weights.columns)
+        ticker_map = {f"{ticker}_weight": ticker for ticker in self.tickers}
+        # Format: {ticker: (original_weight, original_contracts, dv01, price)}
+        contract_info = {
+            desc[0]: {
+                "orig_weight": desc[3],
+                "orig_contracts": desc[4],
+                "dv01": desc[6],
+                "price": desc[7]
+            }
+            for desc in self.adj_descs
+        }
+        for col in self.rolling_mvo_weights.columns:
+            ticker = ticker_map[col]
+            info = contract_info[ticker]
+            base_scale = info["orig_contracts"] / info["orig_weight"] if info["orig_weight"] > 0 else 0
+            contracts_df[col] = (self.rolling_mvo_weights[col] * base_scale).round().astype(int)
+        rename_map = {col: f"{col.replace('_weight', '')}_contracts" for col in contracts_df.columns}
+        contracts_df.rename(columns=rename_map, inplace=True)
+        self.rolling_mvo_contracts = contracts_df
+        return contracts_df
+
+    def calculate_rolling_results(self, window=100, rfrate=0, criteria='Sharpe', min_w=0.0, shift=0):
+        """
+        Calculates rolling strategy returns and trading costs in basis points.
+
+        Steps:
+            1. Runs rolling MVO and contract computation if not already done.
+            2. Shifts weights by 1 day to simulate prior allocation.
+            3. Computes absolute changes in contracts.
+            4. Calculates trading costs using:
+            - For regular futures: abs(contract change) * cost * contract size * duration / 10000
+            - For 'Curncy' tickers: abs(contract change) * cost * dv01
+            Then divides by total notional of prior day to get cost in bps.
+            5. Calculates rolling returns from unweighted returns * weights.
+            6. Returns net returns (gross - cost).
+
+        Returns:
+            net_returns (pd.Series): Daily net returns of the strategy.
+        """
+        if not hasattr(self, 'rolling_mvo_weights') or self.rolling_mvo_weights is None:
+            self.rolling_mvo_weights = self.get_rolling_weights(window=window, rfrate=rfrate, criteria=criteria, min_w=min_w)
+            self.fill_rolling_mvo_weights()
+            self.rolling_mvo_contracts = self.get_rolling_contracts()
+        data = self.data.copy()
+        data.set_index('Date', inplace=True)
+        data.sort_index(ascending=True, inplace=True)
+        contracts = self.rolling_mvo_contracts.copy()
+        contract_changes = contracts.diff().abs().shift(shift).fillna(0)
+        prev_contracts = contracts.shift(shift).fillna(0)
+        trading_costs_dollar = pd.Series(0, index=data.index, dtype=float)
+        total_notional = pd.Series(0, index=data.index, dtype=float)
+        for col in contracts.columns:
+            ticker = col.replace('_contracts', '')
+            if f'{ticker}_mid' not in data.columns:
+                continue
+            contract_size = next((desc[7]*desc[6] for desc in self.adj_descs if desc[0] == ticker), 1)
+            dv01 = next((desc[5] for desc in self.adj_descs if desc[0] == ticker), 1)
+            duration = data.get(f'{ticker}_Dur', pd.Series(index=data.index)).fillna(0)
+            abs_changes = contract_changes[col].reindex(data.index).fillna(0)
+            prev_contr = prev_contracts[col].reindex(data.index).fillna(0)
+            if ticker.endswith(' Curncy'):
+                notional = prev_contr * contract_size
+                trading_costs_dollar += abs_changes * self.trade_cost * dv01
+                total_notional += prev_contr * contract_size
+            else:
+                notional = prev_contr * contract_size
+                trading_costs_dollar += abs_changes * self.trade_cost * contract_size * duration / 10000
+                total_notional += notional
+        trading_costs = trading_costs_dollar / total_notional.replace(0, np.nan)
+        trading_costs = trading_costs.fillna(0)
+        weights = self.rolling_mvo_weights.shift(shift)
+        unweighted_rtns = self.consolidate_rtns().filter(like='_DailyReturn_unweighed')
+        unweighted_rtns.columns = [col.replace('_DailyReturn_unweighed', '_weight') for col in unweighted_rtns.columns]
+        aligned_weights = weights.reindex(unweighted_rtns.index).fillna(0)
+        valid_mask = ~unweighted_rtns.isna()
+        weight_sums = (aligned_weights * valid_mask).sum(axis=1)
+        adjusted_weights = aligned_weights.div(weight_sums, axis=0).fillna(0)
+        rolling_gross_returns = (adjusted_weights * unweighted_rtns).sum(axis=1)
+        net_returns = pd.DataFrame(rolling_gross_returns - trading_costs, columns=['DailyReturn'])
+        net_returns['CumulativeReturn'] = net_returns['DailyReturn'].cumsum()
+        self.rolling_mvo_results = net_returns
+        return net_returns
+
+    def compare_HFRIMTF(self, maxLev, rolling_mvo=False):
+        """
+        Compares the portfolio's monthly returns to the HFRI MTF index under various leverage levels.
+
+        Parameters:
+            maxLev (int): The maximum leverage multiple to compute (e.g., 3 for up to 3x).
+
+        Returns:
+            pd.DataFrame: A DataFrame with monthly returns of the HFRI MTF index, 
+                          the portfolio (1x), and leveraged versions (2x to maxLev x).
+        """
+        hfri = get_HFRIMTF().resample('ME').sum()
+        if rolling_mvo:
+            if self.rolling_mvo_results is None:
+                print("Run calculate_rolling_results method before running this method.")
+            port = self.rolling_mvo_results['DailyReturn'].resample('ME').sum()
+        else:
+            port = self.consolidate_rtns()['DailyReturn'].resample('ME').sum()
+        consolidate = pd.concat([hfri, port], axis=1)
+        consolidate.columns = ['HFRIMTF MonRtn', 'Portfolio MonRtn 1x']
+        for lev in range(2, maxLev + 1):
+            consolidate[f'Portfolio MonRtn {lev}x'] = consolidate['Portfolio MonRtn 1x'] * lev
+        return consolidate
+    
+    def plot_against_HFRIMTF(self, maxLev, startdate, enddate=None, rolling_mvo=False):
+        """
+        Plots cumulative returns of the strategy vs. the HFRI MTF benchmark.
+
+        Parameters:
+            maxLev (float): The maximum leverage to apply to the strategy returns (e.g., 3 for 3x).
+            startdate (str): The start date (YYYY-MM-DD) for plotting cumulative returns.
+
+        Notes:
+            - Uses the `compare_HFRIMTF` method internally.
+            - HFRI MTF index is plotted as a dotted line for comparison.
+        """
+        consolidate = self.compare_HFRIMTF(maxLev=maxLev, rolling_mvo=rolling_mvo)
+        if enddate is None:
+            plot_cum_rtns(consolidate[consolidate.index >= startdate], dotted_series='HFRIMTF MonRtn')
+        else:
+            plot_cum_rtns(consolidate[(consolidate.index >= startdate) & (consolidate.index <= enddate)], dotted_series='HFRIMTF MonRtn')
+
+
+class FutureAndSpread:
+    """
+    Combines futures and long-short spread portfolios into a unified portfolio framework.
+
+    This class:
+        - Merges returns from futures and long-short spread portfolios.
+        - Applies proportional weights based on number of instruments in each group.
+        - Computes total and cumulative returns.
+        - Provides comparison to HFRI MTF benchmark at various leverage levels.
+        - Supports visualization of cumulative return profiles.
+
+    Attributes:
+        port_fut (object): PortfolioMomentum-like object containing futures strategy.
+        port_ls (object): PortfolioMomentum-like object containing long-short strategy.
+        fut_descs (list): List of futures instrument descriptions.
+        ls_unpacked (list): Unpacked long-short spread metadata.
+        fut_len (int): Number of futures instruments.
+        ls_len (int): Number of long-short spread instruments.
+        tot_len (int): Total instruments in combined portfolio.
+        combined (pd.DataFrame): Consolidated return DataFrame.
+    """
+    def __init__(self, PortfolioFut, PortfolioLS):
+        """
+        Initializes the FutureAndSpread combination.
+
+        Parameters:
+            PortfolioFut (object): PortfolioMomentum object for futures strategy.
+            PortfolioLS (object): PortfolioMomentum object for long-short strategy.
+
+        Raises:
+            ValueError: If either PortfolioFut or PortfolioLS is None.
+        """
+        if PortfolioFut is None or PortfolioLS is None:
+            raise ValueError("Both PortfolioFut and PortfolioLS must be provided.")
+        self.port_fut = PortfolioFut
+        self.port_ls = PortfolioLS
+        self._consolidated_fut = None
+        self._consolidated_ls = None
+        self.ls_unpacked = getattr(PortfolioLS, 'unpacked', {})
+        self.fut_descs = getattr(PortfolioFut, 'adj_descs', [])
+        self.fut_len = len(self.fut_descs)
+        self.ls_len = len(self.ls_unpacked)
+        self.tot_len = self.fut_len + self.ls_len
+        self.combined = None
+        self.combined_dynamic_vol = None
+
+    def consolidate_returns(self):
+        """
+        Consolidates return streams from futures and long-short spreads.
+
+        Returns:
+            pd.DataFrame: Combined portfolio return DataFrame including:
+                - Weighted individual asset returns
+                - Total daily return
+                - Cumulative portfolio return
+        """
+        if self._consolidated_fut is None:
+            self._consolidated_fut = self.port_fut.consolidate_rtns()
+        if self._consolidated_ls is None:
+            self._consolidated_ls = self.port_ls.consolidate_rtns()
+        rtns_fut = self._consolidated_fut.drop(columns=['DailyReturn', 'TotalWeight', 'CumulativeReturn'])
+        rtns_ls = self._consolidated_ls.drop(columns=['DailyReturn', 'TotalWeight', 'CumulativeReturn'])
+        weight_cols_fut = [col for col in rtns_fut.columns if col.endswith('_weight')]
+        weight_cols_ls = [col for col in rtns_ls.columns if col.endswith('_weight')]
+        rtns_fut[weight_cols_fut] *= self.fut_len / self.tot_len
+        rtns_ls[weight_cols_ls] *= self.ls_len / self.tot_len
+        combined = pd.concat([rtns_fut, rtns_ls], axis=1)
+        combined = combined.loc[:, ~combined.columns.duplicated()]
+        combined['TotalWeight'] = combined[[col for col in combined.columns if col.endswith('_weight')]].sum(axis=1)
+        for col in combined.columns:
+            if col.endswith('_DailyReturn_unweighed'):
+                base = col.replace('_DailyReturn_unweighed', '')
+                weight_col = f'{base}_weight'
+                if weight_col in combined.columns:
+                    combined[f'{base}_DailyReturn'] = combined[col] * combined[weight_col]
+        daily_return_cols = [col for col in combined.columns if col.endswith('_DailyReturn')]
+        combined['DailyReturn'] = combined[daily_return_cols].sum(axis=1)
+        combined['DailyReturn'] /= combined['TotalWeight']
+        combined['CumulativeReturn'] = combined['DailyReturn'].cumsum()
+        self.combined = combined
+        return combined
+
+    def compare_HFRIMTF(self, maxLev, dynamic=False):
+        """
+        Compares the monthly returns of the portfolio to the HFRI MTF benchmark at different leverage levels.
+
+        Parameters:
+            maxLev (int): Maximum leverage multiplier to compute (e.g., 3 = 1x, 2x, 3x returns).
+
+        Returns:
+            pd.DataFrame: Monthly return comparison of HFRI MTF and portfolio (1x to maxLev x).
+        """
+        if self.combined is None:
+            self.consolidate_returns()
+        if dynamic:
+            if self.combined_dynamic_vol is None:
+                print('must run vol_dynamic method')
+                return
+            else:
+                port = self.combined_dynamic_vol['DailyReturn'].resample('ME').sum()
+                hfri = get_HFRIMTF().resample('ME').sum()
+                consolidate = pd.concat([hfri, port], axis=1)
+                consolidate.columns = ['HFRIMTF MonRtn', 'Portfolio MonRtn 1x']
+                for lev in range(2, maxLev + 1):
+                    consolidate[f'Portfolio MonRtn {lev}x'] = consolidate['Portfolio MonRtn 1x'] * lev
+                return consolidate
+        else:
+            port = self.combined['DailyReturn'].resample('ME').sum()
+            hfri = get_HFRIMTF().resample('ME').sum()
+            consolidate = pd.concat([hfri, port], axis=1)
+            consolidate.columns = ['HFRIMTF MonRtn', 'Portfolio MonRtn 1x']
+            for lev in range(2, maxLev + 1):
+                consolidate[f'Portfolio MonRtn {lev}x'] = consolidate['Portfolio MonRtn 1x'] * lev
+            return consolidate
+    
+    def plot_against_HFRIMTF(self, maxLev, startdate, enddate=None, dynamic=False):
+        """
+        Plots cumulative returns of the portfolio vs. HFRI MTF index.
+
+        Parameters:
+            maxLev (float): Maximum leverage multiplier (e.g., 3).
+            startdate (str): Start date for plotting (YYYY-MM-DD).
+            enddate (str, optional): End date for plotting.
+        """
+        consolidate = self.compare_HFRIMTF(maxLev=maxLev, dynamic=dynamic)
+        if enddate is None:
+            plot_cum_rtns(consolidate[consolidate.index >= startdate], dotted_series='HFRIMTF MonRtn')
+        else:
+            plot_cum_rtns(consolidate[(consolidate.index >= startdate) & (consolidate.index <= enddate)], dotted_series='HFRIMTF MonRtn')
+    
+    def vol_dynamic(self, data, volcol, level, multi=2, cost=0.35, shift=1):
+        if self.combined is None:
+            self.consolidate_returns()
+        df = pd.DataFrame(self.combined[['DailyReturn']])
+        vol = data[['Date',volcol]].set_index('Date')
+        vol = vol.sort_index(ascending=True)
+        df = df.join(vol)
+        df[volcol] = df[volcol].ffill()
+        df = df.dropna()
+        df['Multiple'] = np.where(df[volcol]>=level, multi, 1)
+        df['DailyReturn'] *= df['Multiple'].shift(shift)
+        df['DailyReturn'] -= df['Multiple'].diff().abs().shift(shift)*cost/10000
+        df['CumulativeReturn'] = df['DailyReturn'].cumsum()
+        self.combined_dynamic_vol = df[shift:]
