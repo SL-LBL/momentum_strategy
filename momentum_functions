@@ -1,0 +1,808 @@
+from .util_function import *
+from .sql_handler import *
+# from concurrent.futures import ProcessPoolExecutor, as_completed
+# import multiprocessing
+# import math
+
+
+################################################# Preliminary Class #################################################
+class TransformTickerDescs:
+    """
+    A class to calculate position sizing (weights, contracts, notionals) for different types of fixed income securities
+    based on a DV01 budget and investment amount.
+    """
+    def __init__(self, tickerDescs, budget, AmtInvested):
+        """
+        Initialize the TransformTickerDescs object.
+
+        Parameters:
+        ----------
+        tickerDescs : list of tuples
+            Description of each security. The structure depends on the type (futures, yields, or long-short pairs):
+
+            Futures: (Ticker, Currency, Duration, Weight, MV/Contract, FXRate, ContractSizeLocal, fast_window, slow_window, fast_slope, slow_slope, slope_buffer)
+            Long-Short Futures: (Ticker, Currency, Duration, Direction, Pair#, Weight, MV/Contract, FXRate, ContractSizeLocal)
+
+        budget : float
+            The total DV01 budget to allocate across all instruments (usually in CAD or USD).
+
+        AmtInvested : float
+            The target total notional exposure.
+        """
+        self.tickerDescs = tickerDescs
+        self.budget = budget
+        self.AmtInvested = AmtInvested
+
+    def futures(self):
+        """
+        Compute notional, weights, and number of contracts for each **futures contract** 
+        based on DV01 budget and instrument characteristics.
+
+        Returns:
+        -------
+        list of tuples:
+            Each tuple represents a futures instrument:
+            (Ticker, Currency, Notional (CAD), Weight, #Contracts, DV01 (CAD), FXRate, ContractSize (Local), fast_window, slow_window)
+        """
+        dv01s = [x[6]*x[5]*x[2]/10000 for x in self.tickerDescs]
+        budgetShare = self.budget/len(self.tickerDescs)
+        contracts = [round(budgetShare/dv01s[idx]) for idx, x in enumerate(self.tickerDescs)]
+        notionals = [contracts[idx]*x[5]*x[6] for idx, x in enumerate(self.tickerDescs)]
+        totalNotional = sum(notionals)
+        tickerDescs = [x[:2]+(contracts[idx]*x[6]*x[5], notionals[idx]/totalNotional, contracts[idx], dv01s[idx])+x[5:] for idx, x in enumerate(self.tickerDescs)]  
+        return tickerDescs
+
+    def long_short(self):
+        """
+        Compute notional, weights, and number of contracts for **long-short futures pairs** 
+        based on the DV01 budget. Each pair receives equal DV01 budget.
+
+        Returns:
+        -------
+        list of tuples:
+            Each tuple represents a leg of a long-short pair:
+            (Ticker, Currency, Direction, Pair#, Notional, Weight, #Contracts, DV01 (CAD), FXRate, ContractSize (Local), fast_window, slow_window)
+        """
+        dv01s = [x[7]*x[8]*x[4]/10000 for x in self.tickerDescs]
+        budgetShare = self.budget/len(set([x[3] for x in self.tickerDescs])) # Each each pair equally splits the total dv01 budget
+        contracts = [x[2]*round(budgetShare/dv01s[idx]) for idx, x in enumerate(self.tickerDescs)]
+        notionals = [contracts[idx]*x[7]*x[8] for idx, x in enumerate(self.tickerDescs)]
+        grossNotional = sum(abs(notional) for notional in notionals)
+        tickerDescs = [x[:4] + (notionals[idx], notionals[idx]/grossNotional, contracts[idx], dv01s[idx]) + x[8:] for idx, x in enumerate(self.tickerDescs)]            
+        return tickerDescs
+
+    def tickers(self):
+        """
+        Extract and return the list of tickers from the ticker descriptions.
+
+        Returns:
+        -------
+        list of str:
+            Ticker names (e.g., "TY", "RX", etc.)
+        """
+        return [x[0] for x in self.tickerDescs]
+
+    def unpack_long_short(self):
+        """
+        Transform long-short futures output into a dictionary grouped by pair number.
+
+        Returns:
+        -------
+        dict:
+            A dictionary with one entry per pair, each containing:
+            {
+                pair_number: {
+                    'tickers': [list of ticker symbols],
+                    'currencies': [list of currencies],
+                    'directions': [1/-1],
+                    'notionals': [CAD notional],
+                    'weights': [portfolio weights],
+                    'contracts': [number of contracts],
+                    'dv01s': [DV01 (CAD)],
+                    'contract_sizes': [local contract sizes]
+                }
+            }
+        """
+        LongShortDescs = self.long_short()
+        LongShortDict = {}
+        for pair_num in set(x[3] for x in LongShortDescs):
+            LongShortDict[pair_num] = {}
+            LongShortDict[pair_num]['tickers'] = [x[0] for x in LongShortDescs if x[3] == pair_num]
+            LongShortDict[pair_num]['currencies'] = [x[1] for x in LongShortDescs if x[3] == pair_num]
+            LongShortDict[pair_num]['directions'] = [x[2] for x in LongShortDescs if x[3] == pair_num]
+            LongShortDict[pair_num]['notionals'] = [x[4] for x in LongShortDescs if x[3] == pair_num]
+            LongShortDict[pair_num]['weights'] = [x[5] for x in LongShortDescs if x[3] == pair_num]
+            LongShortDict[pair_num]['contracts'] = [x[6] for x in LongShortDescs if x[3] == pair_num]
+            LongShortDict[pair_num]['dv01s'] = [x[7] for x in LongShortDescs if x[3] == pair_num]
+            LongShortDict[pair_num]['contract_sizes'] = [x[8] for x in LongShortDescs if x[3] == pair_num]
+        return LongShortDict
+    
+    # def yields(self):
+    #     """
+    #     Calculate weights based on ticker descriptions, budget and amount invested. (For data in yields)
+
+    #     Returns:
+    #     list of tuples: Modified ticker descriptions with futures in the following order:
+    #     (Ticker, Currency, Duration, Weight, Notionals, fast_window, slow_window)
+    #     """
+    #     wghts = [1/x[2] for x in self.tickerDescs]
+    #     totalW = sum(wghts)
+    #     wghts = [x/totalW for x in wghts]
+    #     tickerDescs = [x[:3]+(wghts[idx], round(wghts[idx]*self.AmtInvested,2))+x[5:] for idx, x in enumerate(self.tickerDescs)]
+    #     return tickerDescs
+
+
+################################################# Strategy functions #################################################
+def multi_ma_ols_strategy(ticker, curr, notional, contracts, dv01, cost, df, wait_days=1, flat_position=False, RelativePnL=True,
+                          exog_cols=None, p=1, pskip=1, q=1, qskip=1, n=1, nskip=1, train_window=500, constant=False):
+    if ticker.endswith(" Curncy"):
+        data = df[['Date', f'{ticker}_mid'] + ([curr] if curr != 'CAD' else []) + exog_cols].sort_values('Date', ascending=True).dropna()
+        data.columns = ['Date'] + [ticker] + ([curr] if curr != 'CAD' else [] + exog_cols)
+        data[ticker] = 100 - data[ticker]
+    else:
+        data = df[['Date', f'{ticker}_mid', f'{ticker}_Dur'] + ([curr] if curr != 'CAD' else []) + exog_cols].sort_values('Date', ascending=True).dropna()
+        data.columns = ['Date'] + [ticker, 'duration'] + ([curr] if curr != 'CAD' else []) + exog_cols
+    fcast_series = walk_forward_multi_ols_ma(data=data,
+                                             pred_col=ticker,
+                                             exo_cols=exog_cols,
+                                             train_window=train_window,
+                                             p=p, pskip=pskip,
+                                             q=q, qskip=qskip,
+                                             n=n, nskip=nskip,
+                                             constant=constant)[f'forecasted {ticker}']
+    data = data.set_index('Date')
+    data = data.join(fcast_series)
+    data = data.dropna()
+    data['Signal'] = np.where(data[f'forecasted {ticker}']>0, 1, -1)
+    if flat_position:
+        if ticker.endswith(' Curncy'):
+            data['Signal'] = np.where(data[f'forecasted {ticker}'].abs()<cost, 0, data['Signal'])
+        else:
+            data['Signal'] = np.where(data[f'forecasted {ticker}'].abs()/data['duration']*100<cost, 0, data['Signal'])
+    if ticker.endswith(' Curncy'):
+        data[ticker] = -data[ticker] + 100
+        data['TradeCost'] = abs(data['Signal'].diff()).shift(wait_days-1)*cost*contracts*dv01
+        data['ReturnNoCost'] = -data[ticker].diff()*100*data['Signal'].shift(wait_days)*contracts*dv01
+    else:
+        data['TradeCost'] = abs(data['Signal'].diff()).shift(wait_days-1)*cost*notional*data['duration']/10000
+        data['ReturnNoCost'] = data[ticker].diff()/100*data['Signal'].shift(wait_days)*notional
+    data['DailyReturn'] = data['ReturnNoCost'] - data['TradeCost']
+    if curr != 'CAD':
+        data['ReturnNoCost'] = data['ReturnNoCost' ] * (data[curr].pct_change(fill_method=None) + 1)
+        data['TradeCost'] = data['TradeCost' ] * (data[curr].pct_change(fill_method=None) + 1)
+        data['DailyReturn'] = data['DailyReturn' ] * (data[curr].pct_change(fill_method=None) + 1)
+    data['CumulativeReturn'] = data['DailyReturn'].cumsum() 
+    if RelativePnL:
+        data[['TradeCost','ReturnNoCost','DailyReturn','CumulativeReturn']] = data[['TradeCost','ReturnNoCost','DailyReturn','CumulativeReturn']]/notional    
+    return data.iloc[wait_days:]
+
+def momentum_2nd_order(data, ticker, fast_slope, slow_slope, buffer_2nd, blp_slope=False, override_sig=False, dynamic_alloc=True):
+    """
+    Applies a second-order momentum filter to refine an initial signal using the relative slopes of fast and slow 
+    price change windows. This enhancement helps confirm trend strength and direction before acting on crossover signals.
+
+    Parameters:
+        data (pd.DataFrame): DataFrame that includes a price series for the specified ticker and a precomputed 'Signal' column.
+        ticker (str): Name of the column representing the price series on which to compute momentum slopes.
+        fast_slope (int): Lookback window (in periods) for computing the fast price change.
+        slow_slope (int): Lookback window (in periods) for computing the slow price change. Must be greater than fast_slope.
+        buffer_2nd (float): Threshold for the normalized difference between fast and slow slopes to confirm trend strength.
+        blp_slope (bool, optional): If True, use BLP line (with intercept) as the slope.
+        override_sig (bool, optional): If True, replaces the original signal with the second-order signal.
+        dynamic_alloc (bool, optional): If True, adjusts allocation weights dynamically based on relative slope direction.
+
+    Returns:
+        pd.DataFrame: Modified DataFrame including the following new or updated columns:
+            - 'Pchange_fast': Normalized fast price change.
+            - 'Pchange_slow': Normalized slow price change.
+            - 'Pchange_ratio': Scaled difference between fast and slow slopes (with optional directional correction).
+            - 'dir_correct': Indicator for whether the fast slope contradicts the slow slope direction.
+            - 'alloc_correct': Allocation multiplier (1 or 2) used when dynamic_alloc is enabled.
+            - 'Signal_2nd': Second-order confirmation signal (+1 for bullish, -1 for bearish, 0 otherwise).
+            - 'Signal': Final trading signal after applying the second-order filter.
+            - 'Allocation': Final position allocation size (Signal x alloc_correct), if dynamic_alloc is True.
+    """
+    assert fast_slope < slow_slope
+    if blp_slope:
+        data['Pchange_fast'] = rolling_slope(data[ticker], fast_slope)
+        data['Pchange_slow'] = rolling_slope(data[ticker], slow_slope)
+    else:
+        # Calculate slope = (P(t) - P(t-window)) / window
+        data['Pchange_fast'] = data[ticker].diff(fast_slope) / fast_slope
+        data['Pchange_slow'] = data[ticker].diff(slow_slope) / slow_slope
+    # Calculate slope ratio = (slope(fast) - slope(slow)) / abs(slope(slow))
+    data['Pchange_ratio'] = (data['Pchange_fast'] - data['Pchange_slow']) / data['Pchange_slow'].abs()
+    if dynamic_alloc:
+        # We need to apply a "dire_correct" because when fast<slow but fast&slow>0 (decelerating), ratio will result in negative but we want to long, 
+        # hence we *-1 to correct signal, same applies when decelerating in a slowing markets
+        data['dir_correct'] = np.where(((data['Pchange_fast'] < 0) & (data['Pchange_slow'] < 0) & (data['Pchange_fast'] > data['Pchange_slow'])) |
+                                       ((data['Pchange_fast'] > 0) & (data['Pchange_slow'] > 0) & (data['Pchange_fast'] < data['Pchange_slow'])), -1, 1)
+        # With dynamic allocation, we size decelerating (dir_correct < 0) with a lower allocation, and accelerating with a higher allocation (1 & 2 here)
+        data['alloc_correct'] = np.where(data['dir_correct'] < 0, 1, 2)
+    else:
+        # Without dynamic allocation, we exit when decelerating (hence 0 & 1)
+        data['dir_correct'] = np.where(((data['Pchange_fast'] < 0) & (data['Pchange_slow'] < 0) & (data['Pchange_fast'] > data['Pchange_slow'])) |
+                                       ((data['Pchange_fast'] > 0) & (data['Pchange_slow'] > 0) & (data['Pchange_fast'] < data['Pchange_slow'])), 0, 1)
+    # Muliply original slope ratio with "dir_correct"
+    data['Pchange_ratio'] = data['Pchange_ratio'] * data['dir_correct']
+    data['Signal_2nd'] = 0
+    # Apply buffer threshold to slope ratio
+    data.loc[data['Pchange_ratio'] > buffer_2nd, 'Signal_2nd'] = 1
+    data.loc[data['Pchange_ratio'] < -buffer_2nd, 'Signal_2nd'] = -1
+    if dynamic_alloc:
+        # Only have a position when both signals point in the same direction
+        data['Signal'] = np.where(
+            (data['Signal'] == 1) & (data['Signal_2nd'] == 1), 1,
+            np.where((data['Signal'] == -1) & (data['Signal_2nd'] == -1), -1, 0)
+        ).astype(int)
+        # With dynamic allocation, we have a separate "Allocation" column to size positions
+        data['Allocation'] = data['Signal'] * data['alloc_correct']
+    if override_sig:
+        # If true, we ignore the SMA signal by overriding it with the slope signal
+        data['Signal'] = data['Signal_2nd']
+    else:
+        # Without dynamic allocation, we just use the the Signal column to size positions
+        data['Signal'] = np.where(
+            (data['Signal'] == 1) & (data['Signal_2nd'] == 1), 1,
+            np.where((data['Signal'] == -1) & (data['Signal_2nd'] == -1), -1, 0)
+        ).astype(int)
+    return data
+
+def cross_over_strategy(ticker, curr, notional, contracts, dv01, cost, fast_window, slow_window, df, momentum_2nd=False,
+                        fast_slope=None, slow_slope=None, buffer_2nd=0.0, RelativePnL=False, decay=False, decayrate=None,
+                        ignore_1st_order=False, dynamic_alloc=False, blp_slope=False, wait_days=1):
+    """
+    Implements a crossover momentum trading strategy with optional secondary momentum filtering and dynamic position sizing.
+
+    Parameters:
+        ticker (str): The ticker symbol of the instrument.
+        curr (str): Currency of the instrument; if not 'CAD', FX-adjusted returns are computed.
+        notional (float): Total notional value invested (used when calculating returns).
+        contracts (int): Number of contracts (used for currency instruments like swaps).
+        dv01 (float): DV01 of a single contract; used to scale PnL for currency instruments.
+        cost (float): Per unit trading cost used to compute cost of switching positions.
+        fast_window (int): Window size for fast moving average (FMA).
+        slow_window (int): Window size for slow moving average (SMA).
+        df (DataFrame): DataFrame with at least ['Date', f'{ticker}_mid'] and optionally duration or FX columns.
+
+        momentum_2nd (bool, optional): Whether to apply a secondary momentum filter based on relative slope strength.
+        fast_slope (int, optional): Lookback window for fast price change slope (used in secondary momentum).
+        slow_slope (int, optional): Lookback window for slow price change slope (used in secondary momentum).
+        buffer_2nd (float, optional): Minimum threshold for the fast/slow slope ratio to trigger a signal (used in secondary momentum).
+        RelativePnL (bool, optional): If True, return values are scaled relative to notional (i.e., shown as percentages).
+        decay (bool, optional): If True, use exponentially decaying weights for moving averages instead of simple ones.
+        decayrate (float, optional): Decay rate used when `decay=True`.
+        ignore_1st_order (bool, optional): If True, ignore basic crossover signal and rely solely on secondary momentum filter.
+        dynamic_alloc (bool, optional): If True, adjust allocation size based on alignment of slope direction and strength.
+
+    Returns:
+        DataFrame: A DataFrame with trading signals, position sizing, trade cost, return before and after cost, and cumulative return.
+
+    Notes:
+        - When `momentum_2nd=True`, the strategy applies an additional confirmation based on the relative strength of short-term vs. long-term slopes.
+        - When `ignore_1st_order=True`, the first-order crossover signal is ignored and replaced with the secondary signal from slope comparison.
+        - When `dynamic_alloc=True`, position size is doubled when slope directions are aligned and slope strength supports the trade.
+        - Special handling is done for tickers ending with " Curncy", assumed to be swap spreads: signal is inverted, and `contracts`/`dv01` are used instead of `notional`.
+        - The function returns results from after the maximum of `slow_window` or `slow_slope` to avoid NaNs.
+    """
+    assert fast_window < slow_window
+    # Extract relevant columns from complete dataset
+    if ticker.endswith(" Curncy"): # different calculation for UK because using swaps
+        data = df[['Date', f'{ticker}_mid'] + ([curr] if curr != 'CAD' else [])].set_index('Date').sort_index(ascending=True).dropna()
+        data.columns = [ticker] + ([curr] if curr != 'CAD' else [])
+    else:
+        data = df[['Date', f'{ticker}_mid', f'{ticker}_Dur'] + ([curr] if curr != 'CAD' else [])].set_index('Date').sort_index(ascending=True).dropna()
+        data.columns = [ticker, 'duration'] + ([curr] if curr != 'CAD' else [])
+    if ignore_1st_order:
+        # If we want to ignore SMA signals, force "override" to True and apply previous "momentum_2nd_order" function with override=True
+        if dynamic_alloc:
+            print('Cannot override 1st order signal if dynamica allocation is true')
+        data = momentum_2nd_order(data=data, ticker=ticker, fast_slope=fast_window, slow_slope=slow_window, 
+                                  buffer_2nd=buffer_2nd if buffer_2nd is not None else 0, 
+                                  blp_slope=blp_slope, override_sig=True, dynamic_alloc=False)
+    else:
+        if decay:
+            # If we want to apply exponential decay, this will result in moving averages calculated based off exponential decaying weights (not used in final output)
+            data['FMA'] = decay_moving_avg(data[ticker], fast_window, decayrate=decayrate)
+            data['SMA'] = decay_moving_avg(data[ticker], slow_window, decayrate=decayrate)
+        else:
+            # Otherwise, just calculate simple moving averages
+            data['FMA'] = data[ticker].rolling(window=fast_window).mean()
+            data['SMA'] = data[ticker].rolling(window=slow_window).mean()
+        # Get signal from moving averages
+        data['Signal'] = (data['FMA'] > data['SMA']).astype(int) - (data['FMA'] < data['SMA']).astype(int)
+        if momentum_2nd:
+            # If using 2nd order momentum, apply the previous function with specified parameters
+            data = momentum_2nd_order(data=data, ticker=ticker, fast_slope=fast_slope, slow_slope=slow_slope, 
+                                      buffer_2nd=buffer_2nd if buffer_2nd is not None else 0, 
+                                      blp_slope=blp_slope, dynamic_alloc=dynamic_alloc)
+    if ticker.endswith(" Curncy"): # different calculation for UK because using swaps
+        data['Signal'] = data['Signal'] * -1 # reverse signal because data is expressed in swap spreads instead of prices
+        if dynamic_alloc: # if using dynamic allocation, use "Allocation" column
+            data['Allocation'] = data['Allocation'] * -1 # reverse signal because data is expressed in swap spreads instead of prices
+            data['TradeCost'] = abs(data['Allocation'].diff()).shift(wait_days-1)*cost*contracts*dv01 # cost = cost in bps * #contracts * dv01 * shifted absolute change in allocation
+            data['ReturnNoCost'] =  -data[ticker].diff()*100*data['Allocation'].shift(wait_days)*contracts*dv01 # return = #contracts * dv01 * shifted allocation
+        else: # if not, use "Signal" column
+            data['TradeCost'] = abs(data['Signal'].diff()).shift(wait_days-1)*cost*contracts*dv01 # cost = cost in bps * #contracts * dv01 * shifted absolute change in signal
+            data['ReturnNoCost'] =  -data[ticker].diff()*100*data['Signal'].shift(wait_days)*contracts*dv01 # return = #contracts * dv01 * shifted signal
+    else: # futures case
+        if dynamic_alloc:
+            data['TradeCost'] = abs(data['Allocation'].diff()).shift(wait_days-1)*cost*notional*data['duration']/10000 # cost = cost in bps * notional * duration / 10000
+            data['ReturnNoCost'] =  data[ticker].diff()/100*data['Allocation'].shift(wait_days)*notional # return = change in price/100 * notional * shifted allocation
+        else:
+            data['TradeCost'] = abs(data['Signal'].diff()).shift(wait_days-1)*cost*notional*data['duration']/10000
+            data['ReturnNoCost'] =  data[ticker].diff()/100*data['Signal'].shift(wait_days)*notional # return = change in price/100 * notional * shifted signal
+    data['DailyReturn'] = data['ReturnNoCost'] - data['TradeCost'] # Generate post-cost PnL (pre-cost - cost)
+    if curr != 'CAD': # If we want to overlay FX movements, we inflate/deflate daily PnLs with %change in FX rate
+        data['ReturnNoCost'] = data['ReturnNoCost' ] * (data[curr].pct_change(fill_method=None) + 1)
+        data['TradeCost'] = data['TradeCost' ] * (data[curr].pct_change(fill_method=None) + 1)
+        data['DailyReturn'] = data['DailyReturn' ] * (data[curr].pct_change(fill_method=None) + 1)
+    data['CumulativeReturn'] = data['DailyReturn'].cumsum() # Generate cumulative post-cost PnL 
+    if RelativePnL: #Rescale so that PnL is in % format
+        data[['TradeCost','ReturnNoCost','DailyReturn','CumulativeReturn']] = data[['TradeCost','ReturnNoCost','DailyReturn','CumulativeReturn']]/notional    
+    return data.iloc[max(slow_window, slow_slope if slow_slope is not None else 0) + 1:] if momentum_2nd else data.iloc[slow_window:]
+
+
+def cross_over_strategy_long_short(ticker, currency, direction, notional, contracts, dv01, cost, fast_window, slow_window, df, momentum_2nd=False,
+                                   fast_slope=None, slow_slope=None, buffer_2nd=0.0, RelativePnL=False, decay=False, decayrate=None,
+                                   ignore_1st_order=False, dynamic_alloc=False, blp_slope=False, wait_days=1):
+    """
+    Implements a long-short crossover trading strategy using two instruments and calculates associated PnL metrics.
+
+    Parameters
+    ----------
+    ticker : list of str
+        List of two ticker symbols to be used in the strategy.
+    currency : list of str
+        List of the two side's local currencies.
+    direction : list of int
+        List of two integers (1 or -1) indicating long (1) or short (-1) position for each ticker.
+    notional : list of float
+        List of notional values for each ticker.
+    contracts : list of int
+        The number of contracts needed for each ticker.
+    dv01 : list of float
+        DV01 of each contract.
+    cost : float
+        Trading cost in basis points (bps).
+    fast_window : int
+        Window size for the fast moving average.
+    slow_window : int
+        Window size for the slow moving average.
+    df : pandas.DataFrame
+        Input DataFrame containing 'Date', mid prices, and durations for each ticker.
+    momentum_2nd : bool, optional
+        If True, applies a second-order momentum filter. Default is False.
+    fast_slope : int, optional
+        Window for fast slope in second-order momentum.
+    slow_slope : int, optional
+        Window for slow slope in second-order momentum.
+    buffer_2nd : float, optional
+        Threshold buffer for second-order signal confirmation.
+    RelativePnL : bool, optional
+        If True, returns are scaled by total notional (relative terms). Default is False.
+    decay : bool, optional
+        If True, applies exponential decay to moving average calculations. Default is False.
+    decayrate : float, optional
+        Decay rate used if decay is True.
+    ignore_1st_order : bool, optional
+        If True, bypasses first-order signal and applies second-order logic only. Default is False.
+    dynamic_alloc : bool, optional
+        If True, uses allocation weights instead of fixed signals. Default is False.
+
+    Returns
+    -------
+    pandas.DataFrame
+        A DataFrame indexed by date with calculated signals, trade costs, pre- and post-cost returns, and cumulative returns.
+    """
+    assert fast_window < slow_window
+    # Get relevant columns from the whole dataset
+    tick = [tic+'_mid' for tic in ticker]
+    dur = [tic+'_Dur' for tic in ticker if not tic.endswith(' Curncy')]
+    curr = list(set([cur for cur in currency if cur != 'CAD']))
+    data = df[['Date']+tick+dur+curr].set_index('Date').sort_index(ascending=True).dropna()
+    data.columns = ticker + dur + curr
+    long_short_name = '_'.join([f"{tick}{'long' if dirc==1 else 'short'}" for tick, dirc in zip(ticker, direction)]) # generate name as ticker1_long_ticker2_short
+    data.update({tick: 100 - data[tick] for tick in ticker if tick.endswith(' Curncy')}) # invert UK SONIA swap to generate signals.
+    data[long_short_name] = data[ticker[0]]*direction[0] + data[ticker[1]]*direction[1] # create a column as the difference in price for signal calculation
+    if ignore_1st_order:
+        # If we want to ignore SMA signals, force "override" to True and apply previous "momentum_2nd_order" function with override=True
+        if dynamic_alloc:
+            print('Cannot override 1st order signal if dynamica allocation is true')
+        data = momentum_2nd_order(data=data, ticker=long_short_name, fast_slope=fast_window, slow_slope=slow_window, 
+                                  blp_slope=blp_slope, buffer_2nd=buffer_2nd if buffer_2nd is not None else 0, 
+                                  override_sig=True, dynamic_alloc=False)
+    else:
+        if decay:
+            # If we want to apply exponential decay, this will result in moving averages calculated based off exponential decaying weights (not used in final output)
+            data['FMA'] = decay_moving_avg(data[long_short_name], fast_window, decayrate=decayrate)
+            data['SMA'] = decay_moving_avg(data[long_short_name], slow_window, decayrate=decayrate)
+        else:
+            # Otherwise, just calculate simple moving averages off the difference column
+            data['FMA'] = data[long_short_name].rolling(window=fast_window).mean()
+            data['SMA'] = data[long_short_name].rolling(window=slow_window).mean()
+        data['Signal'] = (data['FMA'] > data['SMA']).astype(int) - (data['FMA'] < data['SMA']).astype(int) # SMA signals
+        if momentum_2nd:
+            data = momentum_2nd_order(data=data, ticker=long_short_name, fast_slope=fast_slope, slow_slope=slow_slope, 
+                                      buffer_2nd=buffer_2nd if buffer_2nd is not None else 0, 
+                                      blp_slope=blp_slope, dynamic_alloc=dynamic_alloc)
+    for idx, tick in enumerate(ticker): # Calculate trade cost and pnl for each leg separately
+        if tick.endswith(' Curncy'): # For UK, note we don't need to multiply signal/allocation by -1 because the series has already been flipped
+            if dynamic_alloc: # When using dynamic allocation, calculate return & cost off "Allocation" column
+                data[f'{tick}_TradeCost'] = abs(data['Allocation'].diff()).shift(wait_days-1)*cost*abs(contracts[idx])*dv01[idx]
+                data[f'{tick}_ReturnNoCost'] = data[tick].diff()*100*data['Allocation'].shift(wait_days)*contracts[idx]*dv01[idx]
+            else: # Else, use the "Signal" column
+                data[f'{tick}_TradeCost'] = abs(data['Signal'].diff()).shift(wait_days-1)*cost*abs(contracts[idx])*dv01[idx]
+                data[f'{tick}_ReturnNoCost'] = data[tick].diff()*100*data['Signal'].shift(wait_days)*contracts[idx]*dv01[idx]
+            if currency[idx] != 'CAD': # Apply FX overlay to returns if currency not set to CAD
+                data[f'{tick}_TradeCost'] = data[f'{tick}_TradeCost'] * (data[currency[idx]].pct_change(fill_method=None) + 1)
+                data[f'{tick}_ReturnNoCost'] = data[f'{tick}_ReturnNoCost'] * (data[currency[idx]].pct_change(fill_method=None) + 1)
+        else: # Same process but for futures
+            if dynamic_alloc:
+                data[f'{tick}_TradeCost'] = abs(data['Allocation'].diff()).shift(wait_days-1)*cost*abs(notional[idx])*data[f'{tick}_Dur']/10000
+                data[f'{tick}_ReturnNoCost'] = data[tick].diff()/100*data['Allocation'].shift(wait_days)*notional[idx]
+            else:
+                data[f'{tick}_TradeCost'] = abs(data['Signal'].diff()).shift(wait_days-1)*cost*abs(notional[idx])*data[f'{tick}_Dur']/10000
+                data[f'{tick}_ReturnNoCost'] = data[tick].diff()/100*data['Signal'].shift(wait_days)*notional[idx]
+            if currency[idx] != 'CAD':
+                data[f'{tick}_TradeCost'] = data[f'{tick}_TradeCost'] * (data[currency[idx]].pct_change(fill_method=None) + 1)
+                data[f'{tick}_ReturnNoCost'] = data[f'{tick}_ReturnNoCost'] * (data[currency[idx]].pct_change(fill_method=None) + 1)
+    data['ReturnNoCost'] = data[[f'{tick}_ReturnNoCost'for tick in ticker]].sum(axis=1) # Aggergate each leg's returns
+    data['TradeCost'] = data[[f'{tick}_TradeCost' for tick in ticker]].sum(axis=1) # Aggergate each leg's costs
+    data['DailyReturn'] = data['ReturnNoCost'] - data['TradeCost'] # Generate post-cost PnL (pre-cost - cost)
+    data['CumulativeReturn'] = data['DailyReturn'].cumsum() # Generate cumulative post-cost PnL
+    if RelativePnL: #Rescale so that PnL is in % format
+        data[['TradeCost','ReturnNoCost','DailyReturn','CumulativeReturn']] = data[['TradeCost','ReturnNoCost','DailyReturn','CumulativeReturn']]/max([abs(x) for x in notional])
+    return data.iloc[max(slow_window, slow_slope if slow_slope is not None else 0) + 1:] if momentum_2nd else data.iloc[slow_window:]
+
+
+def cum_rtn_r2(data, time=True, series=None):
+    """
+    Compute R-squared of cumulative return regressed on time or another series.
+
+    Parameters:
+        data (pd.DataFrame): Must contain 'CumulativeReturn' and optionally a custom series.
+        time (bool): If True, regress against time index (converted to numeric). Else, use 'series'.
+        series (str): Column name to regress on if time=False.
+
+    Returns:
+        float: R-squared of the regression.
+    """
+    df = data.copy()
+    if time:
+        df = df[['CumulativeReturn']].dropna()
+        df['Time'] = (df.index - df.index[0]).days.astype(float)
+        X_col = df['Time'].values
+    else:
+        if series is None or series not in df.columns:
+            raise ValueError("Must provide a valid 'series' column name when time=False.")
+        df = df[['CumulativeReturn', series]].dropna()
+        X_col = df[series].values
+    y = df['CumulativeReturn'].values.reshape(-1, 1)
+    X = np.column_stack((np.ones(len(X_col)), X_col.reshape(-1, 1)))
+    XtX_inv = np.linalg.inv(X.T @ X)
+    beta = XtX_inv @ X.T @ y
+    y_hat = X @ beta
+    ssr = np.sum((y - y_hat)**2)
+    sst = np.sum((y - np.mean(y))**2)
+    r_squared = 1 - ssr / sst
+    return r_squared
+
+
+def performance_metrics(data, compound=False, deviation=False, r2=False, dev_r2=False):
+    """
+    Computes performance metrics from a DataFrame of strategy results.
+
+    Parameters
+    ----------
+    data : pandas.DataFrame
+        Must contain a 'DailyReturn' column. May optionally contain a 'Signal' column if
+        `deviation` is True.
+    compound : bool, optional
+        Whether to use compounded return calculation in maximum drawdown. Default is False.
+    deviation : bool, optional
+        If True, calculates the deviation of the signal from 50% and a combined 
+        sharpe-deviation score. Requires 'Signal' column. Default is False.
+    r2 : bool, optional
+        If True and cumulative return is positive, calculates an R²-like metric to 
+        evaluate the consistency of returns. Default is False.
+    dev_r2 : bool, optional
+        If True, computes a combined metric using Sharpe, deviation from 50%, and R².
+        Default is False.
+
+    Returns
+    -------
+    pandas.Series
+        A Series containing the following performance metrics:
+        - 'cumulative return': Sum of daily returns
+        - 'return': Mean daily return
+        - 'sharpe': Annualized Sharpe ratio (assumes 252 trading days)
+        - 'deviation from 50': Absolute deviation of average signal from 0.5 (only if `deviation` is True)
+        - 'mdd': Maximum drawdown
+        - 'R2 positive return': R²-like score for positive-return periods (only if `r2` is True)
+        - 'sharpe_dev': Mean of Sharpe and exp-reg penalty from signal deviation (only if `deviation` is True)
+        - 'sharpe_r2': Mean of Sharpe and R² (only if `r2` is True)
+        - 'sharpe_dev_r2': Mean of Sharpe, signal deviation penalty, and R² (only if `dev_r2` is True)
+
+    Notes
+    -----
+    - If required columns are missing or errors occur, NaN values will be returned with error messages printed.
+    - Uses helper functions `calc_mdd`, `relu`, `exp_reg`, and `cum_rtn_r2`.
+    """
+    if data is None or data.empty or 'DailyReturn' not in data.columns:
+        return pd.Series([np.nan]*9, index=[
+            'cumulative return', 'return', 'sharpe', 'deviation from 50', 
+            'mdd', 'R2 positive return', 'sharpe_dev', 'sharpe_r2', 'sharpe_dev_r2'
+        ])
+    try:
+        cum_rtn = data['DailyReturn'].sum()
+        mean_rtn = data['DailyReturn'].mean()
+        std_rtn = data['DailyReturn'].std()
+        sharpe = np.sqrt(252) * mean_rtn / std_rtn if std_rtn != 0 else np.nan
+        try:
+            max_dd = calc_mdd(data, compound=compound)
+        except Exception as e:
+            print("MDD error:", e)
+            max_dd = np.nan
+        if deviation:
+            if 'Signal' not in data.columns:
+                print("Missing 'Signal' column for deviation")
+                dev_from_50 = sharpe_dev = np.nan
+            else:
+                dev_from_50 = abs((data['Signal'] + 1).mean()/2 - 0.5)
+                try:
+                    sharpe_dev = np.mean([relu(sharpe), exp_reg(dev_from_50, 20)])
+                except Exception as e:
+                    print("sharpe_dev error:", e)
+                    sharpe_dev = np.nan
+        else:
+            dev_from_50 = sharpe_dev = np.nan
+        if r2:
+            if cum_rtn > 0:
+                try:
+                    R2_pos_rtn = cum_rtn_r2(data)
+                except Exception as e:
+                    print("R2 calc error:", e)
+                    R2_pos_rtn = np.nan
+            else:
+                R2_pos_rtn = 0
+            sharpe_r2 = np.mean([relu(sharpe), R2_pos_rtn]) if not np.isnan(R2_pos_rtn) else np.nan
+        else:
+            R2_pos_rtn = sharpe_r2 = np.nan
+        if dev_r2:
+            vals = [relu(sharpe)]
+            if not np.isnan(dev_from_50):
+                vals.append(exp_reg(dev_from_50, 10))
+            if not np.isnan(R2_pos_rtn):
+                vals.append(R2_pos_rtn)
+            sharpe_dev_r2 = np.mean(vals) if len(vals) > 1 else np.nan
+        else:
+            sharpe_dev_r2 = np.nan
+        return pd.Series([
+            cum_rtn, mean_rtn, sharpe, dev_from_50, max_dd,
+            R2_pos_rtn, sharpe_dev, sharpe_r2, sharpe_dev_r2
+        ], index=[
+            'cumulative return', 'return', 'sharpe', 'deviation from 50', 
+            'mdd', 'R2 positive return', 'sharpe_dev', 'sharpe_r2', 'sharpe_dev_r2'
+        ])
+    except Exception as e:
+        print("General error:", e)
+        return pd.Series([np.nan]*9, index=[
+            'cumulative return', 'return', 'sharpe', 'deviation from 50', 
+            'mdd', 'R2 positive return', 'sharpe_dev', 'sharpe_r2', 'sharpe_dev_r2'
+        ])
+
+
+# def calc_analytics(data):
+#     """
+#     Calculate trading analytics including returns and Sharpe ratios for different periods.
+
+#     Parameters:
+#     data (DataFrame): The data frame with the price data
+
+#     Returns:
+#     Series: A series with calculated returns and Sharpe ratios
+#     """
+#     colCumRtn = 'CumulativeReturn'
+#     colDlyRtn = 'DailyReturn'
+#     maxDate = data.index.max()
+#     rtn_si = data.loc[maxDate,colCumRtn]
+#     annual_coef = math.sqrt(252) # assuming 252 days a year
+#     daily_risk_free_rate = 0 #480/365  # assuming risk-free rate of 4.8
+#     sharpe_si = annual_coef * (data[colDlyRtn].mean()-daily_risk_free_rate) / data[colDlyRtn].std()
+#     mdd_si = calc_mdd(data)
+#     startDate_1y = maxDate.replace(year = maxDate.year-1)
+#     startDate_1y = data[data.index<startDate_1y].index.max()
+#     if not pd.isnull(startDate_1y):
+#         rtn_1y = rtn_si - data.loc[startDate_1y,colCumRtn]
+#         sharpe_1y = annual_coef * (data[data.index>startDate_1y][colDlyRtn].mean()-daily_risk_free_rate) / data[data.index>startDate_1y][colDlyRtn].std()
+#     else:
+#         rtn_1y = 0
+#         sharpe_1y = 0
+#     mdd_1y = calc_mdd(data[data.index>startDate_1y])
+#     startDate_5y = maxDate.replace(year = maxDate.year-5)
+#     startDate_5y = data[data.index<startDate_5y].index.max()
+#     if not pd.isnull(startDate_5y):
+#         rtn_5y = rtn_si - data.loc[startDate_5y,colCumRtn]
+#         sharpe_5y = annual_coef * (data[data.index>startDate_5y][colDlyRtn].mean()-daily_risk_free_rate) / data[data.index>startDate_5y][colDlyRtn].std()
+#     else:
+#         rtn_5y = 0
+#         sharpe_5y = 0
+#     mdd_5y = calc_mdd(data[data.index>startDate_5y])
+#     startDate_10y = maxDate.replace(year = maxDate.year-10)
+#     startDate_10y = data[data.index<startDate_10y].index.max()
+#     if not pd.isnull(startDate_10y):
+#         rtn_10y = rtn_si - data.loc[startDate_10y,colCumRtn]
+#         sharpe_10y = annual_coef * (data[data.index>startDate_10y][colDlyRtn].mean()-daily_risk_free_rate) / data[data.index>startDate_10y][colDlyRtn].std()
+#     else:
+#         rtn_10y = np.NaN
+#         sharpe_10y = np.NaN
+#     mdd_10y = calc_mdd(data[data.index>startDate_5y])
+#     rtn_blended = np.nanmean((rtn_si, rtn_1y, rtn_5y, rtn_10y))
+#     sharpe_blended = np.nanmean((sharpe_si, sharpe_1y, sharpe_5y, sharpe_10y))
+#     return pd.Series([rtn_si, sharpe_si, mdd_si, startDate_1y, rtn_1y, sharpe_1y, mdd_1y, startDate_5y, rtn_5y, sharpe_5y, mdd_5y, startDate_10y, rtn_10y, sharpe_10y, mdd_10y, rtn_blended, sharpe_blended],
+#                      index=['rtn_si','sharpe_si','mdd_si','startDate_1y','rtn_1y','sharpe_1y','mdd_1y','startDate_5y','rtn_5y','sharpe_5y','mdd_5y','startDate_10y','rtn_10y','sharpe_10y','mdd_10y','rtn_blended','sharpe_blended'])
+
+
+################################################# Window Scenarios #################################################
+class CrossOverScenarios: # This is only used to select windows, it doesn't impact how returns are calculated
+    """
+    Set up maximum windows for fast and slow window selection. Also set up steps in loops.
+    """
+    def __init__(self, fast_start=5, slow_start=20, max_fast=50, max_slow=200, skip=1, 
+                 momentum_2nd=False, ignore_1st_order=False, dynamic_alloc=False, blp_slope=False,
+                 slowslope_start=None, fastslope_start=None, max_slopefast=None, max_slopeslow=None,
+                 skip_slope=None, buffer_start=0.0, max_buffer=0.0, skip_buffer=None,
+                 deviation=False, r2=False, dev_r2=False):
+        self.fast_start = fast_start
+        self.slow_start = slow_start
+        self.skip = skip
+        self.max_fast = max_fast
+        self.max_slow = max_slow
+        self.momentum_2nd = momentum_2nd
+        self.ignore_1st_order = ignore_1st_order
+        self.dynamic_alloc = dynamic_alloc
+        self.blp_slope = blp_slope
+        self.slowslope_start = slowslope_start
+        self.fastslope_start = fastslope_start
+        self.skip_slope = skip_slope
+        self.max_slopefast = max_slopefast
+        self.max_slopeslow = max_slopeslow
+        self.skip_buffer = skip_buffer
+        self.buffer_start = buffer_start
+        self.max_buffer = max_buffer
+        self.deviation = deviation
+        self.r2 = r2
+        self.dev_r2 = dev_r2
+
+    def _frange(self, start, stop, step):
+        if step == 0:
+            if start == stop:
+                yield round(start, 10)
+            else:
+                raise ValueError("Step size cannot be zero unless start == stop")
+        elif start == stop:
+            yield round(start, 10)
+        else:
+            while start < stop:
+                yield round(start, 10)
+                start += step
+
+    def futures_simplified(self, ticker, currency, notional, contracts, dv01, cost, df,
+                        RelativePnL=False, decay=False, decayrate=None):
+        if len(df) <= self.fast_start:
+            return None
+        pnls = pd.DataFrame(range(self.slow_start, self.max_slow + 1, self.skip), columns=['slow_window'])
+        pnls['fast_window'] = pnls['slow_window'].apply(
+            lambda val: range(self.fast_start, min(val // 2, self.max_fast) + 1, self.skip)
+        )
+        pnls = pnls.explode('fast_window', ignore_index=True)
+        if self.ignore_1st_order:
+            pnls = pnls.drop_duplicates(subset=['fast_window', 'slow_window'])
+            if self.max_buffer > 0 and self.buffer_start < self.max_buffer:
+                buffer_vals = [round(i, 10) for i in self._frange(self.buffer_start, self.max_buffer + 0.01, self.skip_buffer)]
+                buffer_df = pd.DataFrame(buffer_vals, columns=['buffer'])
+                pnls = pnls.assign(key=1).merge(buffer_df.assign(key=1), on='key').drop('key', axis=1)
+            else:
+                pnls['buffer'] = 0
+        elif self.momentum_2nd:
+            slope_fast_vals = list(range(self.fastslope_start, self.max_slopefast + 1, self.skip_slope))
+            slope_slow_vals = list(range(self.slowslope_start, self.max_slopeslow + 1, self.skip_slope))
+            buffer_vals = [round(i, 10) for i in self._frange(self.buffer_start, self.max_buffer + 0.01, self.skip_buffer)]
+            slope_combos = pd.DataFrame(
+                [(sf, ss, b) for sf in slope_fast_vals for ss in slope_slow_vals for b in buffer_vals if sf < ss],
+                columns=['fast_slope', 'slow_slope', 'buffer']
+            )
+            pnls = pnls.assign(key=1).merge(slope_combos.assign(key=1), on='key').drop('key', axis=1)
+        def calc_metrics(row):
+            return performance_metrics(
+                cross_over_strategy(
+                    ticker=ticker,
+                    curr=currency,
+                    notional=notional,
+                    contracts=contracts,
+                    dv01=dv01,
+                    cost=cost,
+                    fast_window=row['fast_window'],
+                    slow_window=row['slow_window'],
+                    df=df,
+                    RelativePnL=RelativePnL,
+                    decay=decay,
+                    decayrate=decayrate,
+                    momentum_2nd=self.momentum_2nd,
+                    dynamic_alloc=self.dynamic_alloc,
+                    blp_slope=self.blp_slope,
+                    ignore_1st_order=self.ignore_1st_order,
+                    fast_slope=row.get('fast_slope'),
+                    slow_slope=row.get('slow_slope'),
+                    buffer_2nd=row.get('buffer')
+                ),
+                deviation=self.deviation,
+                r2=self.r2,
+                dev_r2=self.dev_r2
+            )
+        pnls[[
+            'cumulative return', 'return', 'sharpe', 'deviation from 50', 'mdd', 'R2 positive rtn',
+            'sharpe_dev', 'sharpe_r2', 'sharpe_dev_r2'
+        ]] = pnls.apply(calc_metrics, axis=1, result_type='expand')
+        return pnls
+
+    def long_short_simplified(self, ticker, currency, direction, notional, contracts, dv01, cost, df, 
+                            RelativePnL=False, decay=False, decayrate=None):
+        if len(df) <= self.fast_start:
+            return None
+        pnls = pd.DataFrame(range(self.slow_start, self.max_slow + 1, self.skip), columns=['slow_window'])
+        pnls['fast_window'] = pnls['slow_window'].apply(
+            lambda val: range(self.fast_start, min(val // 2, self.max_fast) + 1, self.skip)
+        )
+        pnls = pnls.explode('fast_window', ignore_index=True)
+        if self.ignore_1st_order:
+            pnls = pnls.drop_duplicates(subset=['fast_window', 'slow_window'])
+            if self.max_buffer > 0 and self.buffer_start < self.max_buffer:
+                buffer_vals = [round(i, 10) for i in self._frange(self.buffer_start, self.max_buffer + 0.01, self.skip_buffer)]
+                buffer_df = pd.DataFrame(buffer_vals, columns=['buffer'])
+                pnls = pnls.assign(key=1).merge(buffer_df.assign(key=1), on='key').drop('key', axis=1)
+            else:
+                pnls['buffer'] = 0
+        elif self.momentum_2nd:
+            slope_fast_vals = list(range(self.fastslope_start, self.max_slopefast + 1, self.skip_slope))
+            slope_slow_vals = list(range(self.slowslope_start, self.max_slopeslow + 1, self.skip_slope))
+            buffer_vals = [round(i, 10) for i in self._frange(self.buffer_start, self.max_buffer + 0.01, self.skip_buffer)]
+            slope_combos = pd.DataFrame(
+                [(sf, ss, b) for sf in slope_fast_vals for ss in slope_slow_vals for b in buffer_vals if sf < ss],
+                columns=['fast_slope', 'slow_slope', 'buffer']
+            )
+            pnls = pnls.assign(key=1).merge(slope_combos.assign(key=1), on='key').drop('key', axis=1)
+        def calc_metrics(row):
+            return performance_metrics(
+                cross_over_strategy_long_short(
+                    ticker=ticker,
+                    currency=currency,
+                    direction=direction,
+                    notional=notional,
+                    contracts=contracts,
+                    dv01=dv01,
+                    cost=cost,
+                    fast_window=row['fast_window'],
+                    slow_window=row['slow_window'],
+                    df=df,
+                    RelativePnL=RelativePnL,
+                    decay=decay,
+                    decayrate=decayrate,
+                    momentum_2nd=self.momentum_2nd,
+                    dynamic_alloc=self.dynamic_alloc,
+                    blp_slope=self.blp_slope,
+                    ignore_1st_order=self.ignore_1st_order,
+                    fast_slope=row.get('fast_slope'),
+                    slow_slope=row.get('slow_slope'),
+                    buffer_2nd=row.get('buffer')
+                ),
+                deviation=self.deviation,
+                r2=self.r2,
+                dev_r2=self.dev_r2
+            )
+        pnls[[
+            'cumulative return', 'return', 'sharpe', 'deviation from 50', 'mdd', 'R2 positive rtn',
+            'sharpe_dev', 'sharpe_r2', 'sharpe_dev_r2'
+        ]] = pnls.apply(calc_metrics, axis=1, result_type='expand')
+        return pnls
